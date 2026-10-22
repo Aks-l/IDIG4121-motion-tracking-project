@@ -10,11 +10,16 @@ import pyrealsense2 as rs
 WIDTH, HEIGHT, FPS = 848, 480, 30
 DECIMATION = 2
 
+# Fuse the RGB camera with depth: colour fills in where depth has holes or
+# is unsure, depth vetoes colour where it clearly sees the floor (shadows)
+USE_COLOR = True
+
 # Play area: anything outside this depth band is ignored
 MIN_DEPTH_M = 0.3
 MAX_DEPTH_M = 4.0
 
-# Stop auto-exposure from shifting the depth when a player walks in
+# Stop auto-exposure (and colour white balance) from shifting the image
+# when a player walks in
 LOCK_EXPOSURE = True
 
 WARMUP_FRAMES = 30
@@ -40,6 +45,25 @@ NOISE_MODEL_SCALE = 0.5
 STABLE_VALID_RATIO = 0.6
 EMPTY_VALID_RATIO = 0.1
 
+# Colour background (Horprasert et al. 1999): a change is split into
+# brightness (alpha, 1 = same as the floor) and colour (chromaticity
+# distortion, in noise units). A shadow on the grey floor only lowers
+# alpha; a person usually changes the colour or is much darker/brighter.
+COLOR_MIN_STD = 4.0
+CD_ON = 7.0
+CD_OFF = 4.5
+DARK_ALPHA = 0.45
+BRIGHT_ALPHA = 1.5
+
+# Temporal vote on the fused mask: each pixel keeps a running foreground
+# score; it turns on above MASK_ON and off below MASK_OFF. 1.0 disables.
+MASK_SMOOTHING = 0.5
+MASK_ON = 0.6
+MASK_OFF = 0.3
+
+# Holes inside a body smaller than this (depth dropouts) are filled
+MAX_HOLE_PX = 150
+
 # Slowly absorb drift into the background where nobody is standing
 BG_LEARNING_RATE = 0.01
 
@@ -60,6 +84,9 @@ MIN_EXTREMUM_MM = 120.0
 # Extrema closer to the torso than this are the head, shoulders or hands
 # held against the body
 MIN_HAND_REACH_MM = 350.0
+# A hand already being tracked is still followed down to this share of
+# MIN_HAND_REACH_MM, so it doesn't blink when pulled in a little
+KEEP_REACH_FRACTION = 0.7
 # A hand must be the far end of its limb, within this tolerance
 TIP_TOLERANCE_MM = 40.0
 # Extrema lower than this above the floor are feet
@@ -70,6 +97,8 @@ HAND_LENGTH_MM = 150.0
 # held over the body connects at the shoulder, not through the chest
 # (0 disables)
 DEPTH_JUMP_MM = 100.0
+# Depth holes inside the body up to this many pixels across are bridged
+MAX_DEPTH_FILL_PX = 20
 # Torso = the thickest part of the body (share of the max thickness)
 TORSO_CORE = 0.8
 # A tracked hand may move at most this far between frames to keep its id
@@ -82,23 +111,11 @@ ONE_EURO_MIN_CUTOFF = 1.0
 ONE_EURO_BETA = 20.0
 ONE_EURO_D_CUTOFF = 1.0
 
+# Windows are shown this many times bigger than the processed image
+DISPLAY_SCALE = 2
 
-def start_camera():
-    pipeline = rs.pipeline()
-    config = rs.config()
 
-    config.enable_stream(
-        rs.stream.depth,
-        WIDTH,
-        HEIGHT,
-        rs.format.z16,
-        FPS,
-    )
-
-    profile = pipeline.start(config)
-    depth_sensor = profile.get_device().first_depth_sensor()
-    configure_sensor(depth_sensor)
-
+def make_filters():
     # Recommended order from the librealsense post-processing docs
     decimation = rs.decimation_filter()
     decimation.set_option(rs.option.filter_magnitude, DECIMATION)
@@ -124,7 +141,7 @@ def start_camera():
 
     # No hole_filling_filter: it invents depth from neighbours, which makes
     # holes look like real (noisy) surfaces and causes false detections
-    filters = (
+    return (
         decimation,
         threshold,
         to_disparity,
@@ -132,8 +149,6 @@ def start_camera():
         temporal,
         to_depth,
     )
-
-    return pipeline, profile, depth_sensor, filters
 
 
 def configure_sensor(depth_sensor):
@@ -153,56 +168,155 @@ def configure_sensor(depth_sensor):
         depth_sensor.set_option(rs.option.laser_power, laser_range.max)
 
 
-def set_auto_exposure(depth_sensor, enabled):
-    if depth_sensor.supports(rs.option.enable_auto_exposure):
-        depth_sensor.set_option(
-            rs.option.enable_auto_exposure, 1 if enabled else 0
+def downsample_color(color, shape):
+    # Aligned colour is black where there was no depth to map it with
+    # (and outside the narrower RGB field of view): average only real pixels
+    h, w = shape
+    valid = (color.max(axis=2) > 0).astype(np.float32)
+
+    summed = cv2.resize(
+        color.astype(np.float32), (w, h), interpolation=cv2.INTER_AREA
+    )
+    weight = cv2.resize(valid, (w, h), interpolation=cv2.INTER_AREA)
+
+    small = np.zeros_like(summed)
+    np.divide(
+        summed, weight[..., None], out=small, where=weight[..., None] > 0.5
+    )
+    return small
+
+
+class Camera:
+    def __init__(self):
+        self.pipeline = rs.pipeline()
+        config = rs.config()
+
+        config.enable_stream(
+            rs.stream.depth, WIDTH, HEIGHT, rs.format.z16, FPS
         )
 
+        if USE_COLOR:
+            config.enable_stream(
+                rs.stream.color, WIDTH, HEIGHT, rs.format.bgr8, FPS
+            )
 
-def lock_exposure(pipeline, depth_sensor):
-    if not depth_sensor.supports(rs.option.enable_auto_exposure):
-        return
+        profile = self.pipeline.start(config)
+        device = profile.get_device()
 
-    depth_frame = pipeline.wait_for_frames().get_depth_frame()
-    key = rs.frame_metadata_value.actual_exposure
+        self.depth_sensor = device.first_depth_sensor()
+        configure_sensor(self.depth_sensor)
+        self.depth_scale = self.depth_sensor.get_depth_scale()
 
-    if not depth_frame or not depth_frame.supports_frame_metadata(key):
-        print("Exposure metadata unavailable, keeping auto-exposure on.")
-        return
+        # Full-resolution focal length, used by the stereo noise model
+        self.fx = (
+            profile.get_stream(rs.stream.depth)
+            .as_video_stream_profile()
+            .get_intrinsics()
+            .fx
+        )
 
-    exposure_range = depth_sensor.get_option_range(rs.option.exposure)
-    exposure = float(np.clip(
-        depth_frame.get_frame_metadata(key),
-        exposure_range.min,
-        exposure_range.max,
-    ))
+        self.color_sensor = device.first_color_sensor() if USE_COLOR else None
 
-    set_auto_exposure(depth_sensor, False)
-    depth_sensor.set_option(rs.option.exposure, exposure)
-    print(f"Exposure locked at {exposure:.0f} us.")
+        # Reproject colour onto the depth image, so pixel (x, y) is the
+        # same point of the scene in both
+        self.align = rs.align(rs.stream.depth) if USE_COLOR else None
 
+        self.filters = make_filters()
 
-def get_filtered_depth(pipeline, filters, depth_scale):
-    frames = pipeline.wait_for_frames()
-    depth_frame = frames.get_depth_frame()
+    def read(self):
+        frames = self.pipeline.wait_for_frames()
 
-    if not depth_frame:
-        return None, None
+        if self.align is not None:
+            frames = self.align.process(frames)
 
-    # Apply SDK filters in sequence
-    for filter_ in filters:
-        depth_frame = filter_.process(depth_frame)
+        depth_frame = frames.get_depth_frame()
 
-    depth_frame = depth_frame.as_depth_frame()
+        if not depth_frame:
+            return None, None, None
 
-    depth_mm = (
-        np.asanyarray(depth_frame.get_data()).astype(np.float32)
-        * depth_scale
-        * 1000.0
-    )
+        color = None
+        if self.align is not None:
+            color_frame = frames.get_color_frame()
+            if color_frame:
+                color = np.asanyarray(color_frame.get_data())
 
-    return depth_frame, depth_mm
+        # Apply SDK filters in sequence
+        for filter_ in self.filters:
+            depth_frame = filter_.process(depth_frame)
+
+        depth_frame = depth_frame.as_depth_frame()
+
+        depth_mm = (
+            np.asanyarray(depth_frame.get_data()).astype(np.float32)
+            * self.depth_scale
+            * 1000.0
+        )
+
+        if color is not None:
+            color = downsample_color(color, depth_mm.shape)
+
+        return depth_frame, depth_mm, color
+
+    def set_auto(self, enabled):
+        value = 1 if enabled else 0
+
+        if self.depth_sensor.supports(rs.option.enable_auto_exposure):
+            self.depth_sensor.set_option(rs.option.enable_auto_exposure, value)
+
+        if self.color_sensor is not None:
+            for option in (
+                rs.option.enable_auto_exposure,
+                rs.option.enable_auto_white_balance,
+            ):
+                if self.color_sensor.supports(option):
+                    self.color_sensor.set_option(option, value)
+
+    def lock(self):
+        self._lock_depth()
+
+        if self.color_sensor is not None:
+            self._lock_color()
+
+    def _lock_depth(self):
+        if not self.depth_sensor.supports(rs.option.enable_auto_exposure):
+            return
+
+        depth_frame = self.pipeline.wait_for_frames().get_depth_frame()
+        key = rs.frame_metadata_value.actual_exposure
+
+        if not depth_frame or not depth_frame.supports_frame_metadata(key):
+            print("Exposure metadata unavailable, keeping auto-exposure on.")
+            return
+
+        exposure_range = self.depth_sensor.get_option_range(rs.option.exposure)
+        exposure = float(np.clip(
+            depth_frame.get_frame_metadata(key),
+            exposure_range.min,
+            exposure_range.max,
+        ))
+
+        self.depth_sensor.set_option(rs.option.enable_auto_exposure, 0)
+        self.depth_sensor.set_option(rs.option.exposure, exposure)
+        print(f"Depth exposure locked at {exposure:.0f} us.")
+
+    def _lock_color(self):
+        # Keep the values auto mode settled on, then switch auto off
+        for auto, manual in (
+            (rs.option.enable_auto_exposure, rs.option.exposure),
+            (rs.option.enable_auto_white_balance, rs.option.white_balance),
+        ):
+            sensor = self.color_sensor
+            if not (sensor.supports(auto) and sensor.supports(manual)):
+                continue
+
+            value = sensor.get_option(manual)
+            sensor.set_option(auto, 0)
+            sensor.set_option(manual, value)
+
+        print("Colour exposure and white balance locked.")
+
+    def stop(self):
+        self.pipeline.stop()
 
 
 def preprocess_depth(depth_mm):
@@ -218,6 +332,22 @@ def preprocess_depth(depth_mm):
 
     blurred[valid == 0] = 0
     return blurred
+
+
+def fill_small_holes(mask):
+    # Background pockets fully inside a body (depth dropouts on dark hair
+    # or clothes) are filled; the big outside region is left alone
+    holes = cv2.bitwise_not(mask)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        holes, connectivity=4
+    )
+
+    small = np.zeros(count, dtype=bool)
+    small[1:] = stats[1:, cv2.CC_STAT_AREA] <= MAX_HOLE_PX
+
+    filled = mask.copy()
+    filled[small[labels]] = 255
+    return filled
 
 
 def find_blobs(mask, depth_mm, closer_mm, focal_px):
@@ -282,7 +412,9 @@ def geodesic_distance(walkable, seeds, current=None):
         step += 1
         kernel = CROSS_KERNEL if step % 2 else SQUARE_KERNEL
 
-        grown = cv2.dilate(front.astype(np.uint8), kernel) > 0
+        # Grow from everything reached so far, not just the last ring, or
+        # a pixel touching only diagonally is skipped on a cross step
+        grown = cv2.dilate(reached.astype(np.uint8), kernel) > 0
         front = grown & walkable & ~reached
 
         if current is not None:
@@ -305,11 +437,22 @@ def find_extrema(blob, pixels, depth_mm, closer_mm, mm_per_px):
     walkable = body.copy()
 
     if DEPTH_JUMP_MM > 0:
-        # Fill small holes and the 1 px ring around the body first, or
-        # every hole and the body outline would count as a depth jump
+        # Fill depth holes inside the body (e.g. a black sleeve the colour
+        # camera found but depth can't see) and the ring around the body
+        # from neighbouring body depth, or they'd all count as jumps
         surface = np.where(body & (depth > 0), depth, 0).astype(np.float32)
-        grown = cv2.dilate(surface, SQUARE_KERNEL)
-        surface = np.where(surface > 0, surface, grown)
+
+        for _ in range(MAX_DEPTH_FILL_PX):
+            grown = cv2.dilate(surface, SQUARE_KERNEL)
+            surface = np.where(surface > 0, surface, grown)
+
+            if not (body & (surface == 0)).any():
+                break
+
+        # One more ring so the body outline isn't a jump either
+        surface = np.where(
+            surface > 0, surface, cv2.dilate(surface, SQUARE_KERNEL)
+        )
 
         jump = cv2.morphologyEx(surface, cv2.MORPH_GRADIENT, SQUARE_KERNEL)
         walkable &= jump < DEPTH_JUMP_MM
@@ -349,6 +492,10 @@ def find_extrema(blob, pixels, depth_mm, closer_mm, mm_per_px):
         if tip_steps * mm_per_px < MIN_EXTREMUM_MM:
             break
 
+        # Every walkable pixel is reachable from the torso, but be safe
+        if not np.isfinite(from_torso.flat[tip_index]):
+            break
+
         tip = np.zeros(walkable.shape, dtype=bool)
         tip.flat[tip_index] = True
 
@@ -385,6 +532,7 @@ def find_extrema(blob, pixels, depth_mm, closer_mm, mm_per_px):
             "point": (float(region_x.mean() + x), float(region_y.mean() + y)),
             "height_mm": height_mm,
             "reach_mm": reach_mm,
+            "is_tip": is_tip,
             "kind": kind,
         }
 
@@ -432,12 +580,18 @@ class OneEuroFilter:
 class HandTracker:
     def __init__(self, hands=NUM_HANDS):
         self.hands = hands
-        self.filters = [OneEuroFilter() for _ in range(hands)]
+
+        # Same smoothing for positions, scaled from 0..1 to pixels
+        point_beta = ONE_EURO_BETA / (WIDTH / DECIMATION)
+
+        self.z_filters = [OneEuroFilter() for _ in range(hands)]
+        self.x_filters = [OneEuroFilter(beta=point_beta) for _ in range(hands)]
+        self.y_filters = [OneEuroFilter(beta=point_beta) for _ in range(hands)]
         self.reset()
 
     def reset(self):
-        for hand_filter in self.filters:
-            hand_filter.reset()
+        for slot in range(self.hands):
+            self._reset_filters(slot)
 
         self.z = [None] * self.hands
         self.height_mm = [None] * self.hands
@@ -445,9 +599,14 @@ class HandTracker:
         self.last_points = [None] * self.hands
         self.missing = [0] * self.hands
 
-    def _assign(self, found):
+    def _reset_filters(self, slot):
+        self.z_filters[slot].reset()
+        self.x_filters[slot].reset()
+        self.y_filters[slot].reset()
+
+    def _assign(self, found, keep):
         slots = [None] * self.hands
-        unmatched = list(found)
+        used = set()
 
         # Each hand keeps the id of the hand it was nearest to last frame,
         # so ids survive the player turning around
@@ -455,7 +614,7 @@ class HandTracker:
         for slot, last in enumerate(self.last_points):
             if last is None:
                 continue
-            for hand in found:
+            for hand in found + keep:
                 gap = np.hypot(
                     hand["point"][0] - last[0], hand["point"][1] - last[1]
                 )
@@ -463,11 +622,12 @@ class HandTracker:
                     pairs.append((gap, slot, hand))
 
         for _, slot, hand in sorted(pairs, key=lambda pair: pair[0]):
-            if slots[slot] is None and any(h is hand for h in unmatched):
+            if slots[slot] is None and id(hand) not in used:
                 slots[slot] = hand
-                unmatched = [h for h in unmatched if h is not hand]
+                used.add(id(hand))
 
-        # New hands fill the free ids left to right
+        # Only confident hands start a new id, filled left to right
+        unmatched = [hand for hand in found if id(hand) not in used]
         unmatched.sort(key=lambda hand: hand["point"][0])
         for slot in range(self.hands):
             if slots[slot] is None and unmatched:
@@ -476,16 +636,29 @@ class HandTracker:
         return slots
 
     def update(self, blobs, timestamp):
+        extrema = [extremum for blob in blobs for extremum in blob["extrema"]]
+
         # Hands that reach farthest from their torso are the most reliable
         found = sorted(
-            (hand for blob in blobs for hand in blob["hands"]),
+            (e for e in extrema if e["kind"] == "hand"),
             key=lambda hand: hand["reach_mm"],
             reverse=True,
         )[:self.hands]
 
+        # Near misses (a hand pulled in a little) can continue a track
+        keep_reach = KEEP_REACH_FRACTION * MIN_HAND_REACH_MM
+        keep = [
+            e for e in extrema
+            if e["kind"] == "body"
+            and e["is_tip"]
+            and e["reach_mm"] >= keep_reach
+            and e["height_mm"] is not None
+            and e["height_mm"] >= MIN_HAND_HEIGHT_MM
+        ]
+
         low, high = HAND_HEIGHT_RANGE_MM
 
-        for slot, hand in enumerate(self._assign(found)):
+        for slot, hand in enumerate(self._assign(found, keep)):
             if hand is None:
                 self.points[slot] = None
                 self.missing[slot] += 1
@@ -493,24 +666,30 @@ class HandTracker:
                 if self.missing[slot] > HOLD_FRAMES:
                     self.z[slot] = None
                     self.height_mm[slot] = None
-                    self.filters[slot].reset()
+                    self._reset_filters(slot)
                 continue
 
             self.missing[slot] = 0
-            self.points[slot] = hand["point"]
-            self.last_points[slot] = hand["point"]
+
+            point = (
+                self.x_filters[slot](hand["point"][0], timestamp),
+                self.y_filters[slot](hand["point"][1], timestamp),
+            )
+            self.points[slot] = point
+            self.last_points[slot] = point
             self.height_mm[slot] = hand["height_mm"]
 
             z = (hand["height_mm"] - low) / (high - low)
             z = float(np.clip(z, 0.0, 1.0))
 
-            self.z[slot] = self.filters[slot](z, timestamp)
+            self.z[slot] = self.z_filters[slot](z, timestamp)
 
         return list(self.z)
 
 
-class DepthBackground:
-    def __init__(self, depth_mm, sigma_mm, valid_ratio, fx):
+class SceneBackground:
+    def __init__(self, depth_mm, sigma_mm, valid_ratio, fx,
+                 color_mean=None, color_std=None, color_valid=None):
         self.depth = depth_mm
         self.stable = valid_ratio >= STABLE_VALID_RATIO
         self.empty = valid_ratio < EMPTY_VALID_RATIO
@@ -526,12 +705,46 @@ class DepthBackground:
         self.on_mm = np.maximum(K_SIGMA_ON * self.sigma, MIN_THRESHOLD_MM)
         self.off_mm = self.on_mm * (K_SIGMA_OFF / K_SIGMA_ON)
 
+        self.color_mean = color_mean
+        self.color_std = color_std
+        self.color_valid = color_valid
+
         self.mask = np.zeros(depth_mm.shape, dtype=bool)
+        self.score = np.zeros(depth_mm.shape, dtype=np.float32)
+
+        # Raw depth / colour decisions of the last frame, for the debug view
+        self.depth_foreground = self.mask
+        self.color_foreground = self.mask
 
         # Focal length at the decimated resolution, to turn pixels into mm
         self.focal_px = fx / DECIMATION
 
-    def segment(self, current):
+    @property
+    def has_color(self):
+        return self.color_mean is not None
+
+    def _color_change(self, color):
+        valid = self.color_valid & (color.max(axis=2) > 0)
+
+        # Brightness alpha: how much of the floor colour explains the pixel
+        weight = 1.0 / self.color_std ** 2
+        expected = self.color_mean
+        alpha = (color * expected * weight).sum(axis=2) / np.maximum(
+            (expected ** 2 * weight).sum(axis=2), 1e-6
+        )
+
+        # Chromaticity distortion: what is left after scaling brightness
+        residual = (color - alpha[..., None] * expected) / self.color_std
+        distortion = np.sqrt((residual ** 2).sum(axis=2))
+
+        # Undo global light/exposure changes: most of the floor is free
+        free = valid & ~self.mask
+        if np.count_nonzero(free) > 500:
+            alpha = alpha / max(float(np.median(alpha[free])), 1e-3)
+
+        return valid, alpha, distortion
+
+    def segment(self, current, color=None):
         valid = current > 0
         compare = valid & self.stable
 
@@ -540,25 +753,54 @@ class DepthBackground:
         closer = np.zeros(current.shape, dtype=np.float32)
         closer[compare] = self.depth[compare] - current[compare]
 
-        foreground = compare & (
+        depth_fg = compare & (
             (closer > self.on_mm)
             | (self.mask & (closer > self.off_mm))
         )
 
-        # Nothing was seen here during capture (e.g. beyond MAX_DEPTH_M),
-        # so anything inside the play band now is new
-        foreground |= valid & self.empty
+        if self.has_color and color is not None:
+            color_valid, alpha, distortion = self._color_change(color)
 
+            cd_limit = np.where(self.mask, CD_OFF, CD_ON)
+            color_fg = color_valid & (
+                (distortion > cd_limit)
+                | (alpha < DARK_ALPHA)
+                | (alpha > BRIGHT_ALPHA)
+            )
+
+            # Depth is sure this is still the floor: a shadow, not a person
+            depth_floor = compare & (closer < self.off_mm)
+
+            fused = depth_fg | (color_fg & ~depth_floor)
+        else:
+            color_fg = np.zeros_like(depth_fg)
+
+            # Nothing was seen here during capture (e.g. beyond MAX_DEPTH_M),
+            # so anything inside the play band now is new
+            fused = depth_fg | (valid & self.empty)
+
+        self.depth_foreground = depth_fg
+        self.color_foreground = color_fg
+
+        # Temporal vote: one-frame dropouts and speckles don't flip a pixel
+        self.score += MASK_SMOOTHING * (fused - self.score)
+        foreground = (self.score > MASK_ON) | (
+            self.mask & (self.score > MASK_OFF)
+        )
+
+        # Close before open: opening first erodes away any body pixel that
+        # has a depth dropout nearby, which shreds the mask
         mask = foreground.astype(np.uint8) * 255
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, MORPH_KERNEL)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, MORPH_KERNEL)
+        mask = fill_small_holes(mask)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, MORPH_KERNEL)
 
         mask, blobs = find_blobs(mask, current, closer, self.focal_px)
         self.mask = mask > 0
 
         return closer, mask, blobs
 
-    def update(self, current):
+    def update(self, current, color=None):
         # Keep a margin around players so their edges never leak in
         protected = cv2.dilate(
             self.mask.astype(np.uint8), MORPH_KERNEL, iterations=3
@@ -569,46 +811,19 @@ class DepthBackground:
             current[learn] - self.depth[learn]
         )
 
+        if self.has_color and color is not None:
+            learn = self.color_valid & (color.max(axis=2) > 0) & ~protected
+            self.color_mean[learn] += BG_LEARNING_RATE * (
+                color[learn] - self.color_mean[learn]
+            )
 
-def capture_background(pipeline, filters, depth_sensor, depth_scale, fx,
-                       wait_for_user=True):
-    print("Clear the scene and keep the camera still.")
 
-    if wait_for_user:
-        input("Press Enter to capture the depth background...")
-
-    # Let auto-exposure and the temporal filter settle first
-    set_auto_exposure(depth_sensor, True)
-
-    for _ in range(WARMUP_FRAMES):
-        get_filtered_depth(pipeline, filters, depth_scale)
-
-    if LOCK_EXPOSURE:
-        lock_exposure(pipeline, depth_sensor)
-
-        for _ in range(WARMUP_FRAMES // 2):
-            get_filtered_depth(pipeline, filters, depth_scale)
-
-    samples = []
-
-    for _ in range(BACKGROUND_FRAMES):
-        _, depth_mm = get_filtered_depth(pipeline, filters, depth_scale)
-
-        if depth_mm is not None:
-            samples.append(preprocess_depth(depth_mm))
-
-    if not samples:
-        raise RuntimeError("Could not capture depth background.")
-
-    stack = np.stack(samples, axis=0)
-
+def robust_stats(stack):
+    # Median + MAD: robust per-pixel value and noise, ignoring zeros
     valid = stack > 0
-    valid_ratio = valid.mean(axis=0)
-
-    # Ignore invalid zero-depth samples
+    stack = stack.astype(np.float32)
     stack[~valid] = np.nan
 
-    # Median + MAD: robust per-pixel depth and noise estimate
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         median = np.nanmedian(stack, axis=0)
@@ -616,14 +831,68 @@ def capture_background(pipeline, filters, depth_sensor, depth_scale, fx,
 
     median = np.nan_to_num(median, nan=0.0).astype(np.float32)
     sigma = 1.4826 * np.nan_to_num(mad, nan=0.0).astype(np.float32)
+    return median, sigma, valid.mean(axis=0)
 
-    background = DepthBackground(median, sigma, valid_ratio, fx)
 
-    print(
-        f"Background captured: {background.stable.mean():.0%} stable, "
-        f"{background.empty.mean():.0%} empty, "
-        f"median noise {np.median(background.sigma[background.stable]):.1f} mm."
+def capture_background(camera, wait_for_user=True):
+    print("Clear the scene and keep the camera still.")
+
+    if wait_for_user:
+        input("Press Enter to capture the background...")
+
+    # Let auto-exposure and the temporal filter settle first
+    camera.set_auto(True)
+
+    for _ in range(WARMUP_FRAMES):
+        camera.read()
+
+    if LOCK_EXPOSURE:
+        camera.lock()
+
+        for _ in range(WARMUP_FRAMES // 2):
+            camera.read()
+
+    depth_samples = []
+    color_samples = []
+
+    for _ in range(BACKGROUND_FRAMES):
+        _, depth_mm, color = camera.read()
+
+        if depth_mm is None:
+            continue
+
+        depth_samples.append(preprocess_depth(depth_mm))
+
+        if color is not None:
+            color_samples.append(np.round(color).astype(np.uint8))
+
+    if not depth_samples:
+        raise RuntimeError("Could not capture depth background.")
+
+    depth, sigma, valid_ratio = robust_stats(np.stack(depth_samples))
+
+    color_mean = color_std = color_valid = None
+
+    if len(color_samples) >= BACKGROUND_FRAMES // 2:
+        stack = np.stack(color_samples)
+        color_mean, color_std, _ = robust_stats(stack)
+        color_std = np.maximum(color_std, COLOR_MIN_STD)
+
+        seen = (stack.max(axis=3) > 0).mean(axis=0)
+        color_valid = seen >= STABLE_VALID_RATIO
+
+    background = SceneBackground(
+        depth, sigma, valid_ratio, camera.fx,
+        color_mean, color_std, color_valid,
     )
+
+    message = (
+        f"Background captured: {background.stable.mean():.0%} stable depth, "
+        f"median noise {np.median(background.sigma[background.stable]):.1f} mm"
+    )
+    if background.has_color:
+        message += f", colour covers {background.color_valid.mean():.0%}"
+    print(message + ".")
 
     return background
 
@@ -681,7 +950,7 @@ def draw_hands(image, tracker):
     for slot, z in enumerate(tracker.z):
         color = HAND_COLORS[slot % len(HAND_COLORS)]
 
-        # z gauge along the left edge: empty = on the table, full = high
+        # z gauge along the left edge: empty = waist height, full = high
         x = 10 + slot * 22
         cv2.rectangle(image, (x, top), (x + 14, bottom), color, 1)
 
@@ -706,64 +975,72 @@ def draw_hands(image, tracker):
         )
 
 
+def mask_debug_view(background, mask):
+    # Green = depth says person, red = colour says person, yellow = both;
+    # white outline = final fused mask
+    view = np.zeros(mask.shape + (3,), dtype=np.uint8)
+    view[..., 1] = background.depth_foreground * 200
+    view[..., 2] = background.color_foreground * 200
+
+    contours, _ = cv2.findContours(
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    cv2.drawContours(view, contours, -1, (255, 255, 255), 1)
+    return view
+
+
+def show(name, image):
+    cv2.imshow(name, cv2.resize(
+        image, None, fx=DISPLAY_SCALE, fy=DISPLAY_SCALE,
+        interpolation=cv2.INTER_NEAREST,
+    ))
+
+
 def main():
-    pipeline = None
+    camera = None
 
     try:
-        pipeline, profile, depth_sensor, filters = start_camera()
-
-        # Get the depth scale from the sensor
-        depth_scale = depth_sensor.get_depth_scale()
-
-        # Full-resolution focal length, used by the stereo noise model
-        fx = (
-            profile.get_stream(rs.stream.depth)
-            .as_video_stream_profile()
-            .get_intrinsics()
-            .fx
-        )
-
-        background = capture_background(
-            pipeline, filters, depth_sensor, depth_scale, fx
-        )
+        camera = Camera()
+        background = capture_background(camera)
 
         colorizer = rs.colorizer()
         tracker = HandTracker()
 
         print("Press 'b' to recapture the background, 'q' to quit.")
 
+        names = ["Tracking", "Stable Depth", "Foreground Mask"]
+
         while True:
-            depth_frame, current = get_filtered_depth(
-                pipeline, filters, depth_scale
-            )
+            depth_frame, current, color = camera.read()
 
             if depth_frame is None:
                 continue
 
             blurred = preprocess_depth(current)
-            closer, mask, blobs = background.segment(blurred)
-            background.update(blurred)
+            _, mask, blobs = background.segment(blurred, color)
+            background.update(blurred, color)
 
             hand_z = tracker.update(blobs, time.perf_counter())
 
-            # Display filtered depth
             depth_view = np.asanyarray(
                 colorizer.colorize(depth_frame).get_data()
-            )
-            draw_blobs(depth_view, blobs)
-            draw_hands(depth_view, tracker)
+            ).copy()
 
-            # Visualize how much closer than the background, in millimeters
-            diff_view = np.clip(
-                closer * 255.0 / 200.0, 0, 255
-            ).astype(np.uint8)
+            if color is not None:
+                tracking_view = np.clip(color, 0, 255).astype(np.uint8)
+            else:
+                tracking_view = depth_view.copy()
+
+            for view in (tracking_view, depth_view):
+                draw_blobs(view, blobs)
+                draw_hands(view, tracker)
 
             hands_text = "  ".join(
                 "--" if z is None else f"{z:.2f}" for z in hand_z
             )
 
             cv2.putText(
-                depth_view,
+                tracking_view,
                 f"Hands z: {hands_text}",
                 (20, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
@@ -772,9 +1049,9 @@ def main():
                 2,
             )
 
-            cv2.imshow("Stable Depth", depth_view)
-            cv2.imshow("Depth Difference", diff_view)
-            cv2.imshow("Foreground Mask", mask)
+            show("Tracking", tracking_view)
+            show("Stable Depth", depth_view)
+            show("Foreground Mask", mask_debug_view(background, mask))
 
             key = cv2.waitKey(1) & 0xFF
 
@@ -782,18 +1059,9 @@ def main():
                 break
 
             if key == ord("b"):
-                background = capture_background(
-                    pipeline, filters, depth_sensor, depth_scale, fx,
-                    wait_for_user=False,
-                )
+                background = capture_background(camera, wait_for_user=False)
                 tracker.reset()
                 continue
-
-            names = [
-                "Stable Depth",
-                "Depth Difference",
-                "Foreground Mask",
-            ]
 
             if any(
                 cv2.getWindowProperty(
@@ -807,8 +1075,8 @@ def main():
         print(f"Camera error: {error}")
 
     finally:
-        if pipeline is not None:
-            pipeline.stop()
+        if camera is not None:
+            camera.stop()
 
         cv2.destroyAllWindows()
 
