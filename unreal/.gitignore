@@ -1,0 +1,19 @@
+# Unreal regenerates all of these on the next build / editor launch
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+**/Plugins/*/Binaries/
+**/Plugins/*/Intermediate/
+
+# IDE project files (regenerate with "Generate Project Files")
+*.xcworkspace/
+*.xcodeproj/
+*.sln
+.vs/
+.vscode/
+
+# Local tooling
+.mcp.json
+*.uproject.bak
+.DS_Store

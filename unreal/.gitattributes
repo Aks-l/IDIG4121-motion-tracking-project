@@ -1,0 +1,3 @@
+# Unreal assets are binary: never diff or merge them as text
+*.uasset binary
+*.umap binary
