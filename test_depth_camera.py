@@ -1,4 +1,5 @@
 
+import time
 import warnings
 
 import cv2
@@ -42,6 +43,24 @@ EMPTY_VALID_RATIO = 0.1
 BG_LEARNING_RATE = 0.01
 
 MIN_BLOB_AREA = 150
+
+# Hand tracking (top-down view): the image is split into vertical lanes,
+# one hand per lane, and only the hand's y position is reported (0 = top)
+NUM_LANES = 2
+# Remap this part of the image height to the full 0..1 range
+PLAY_Y_RANGE = (0.1, 0.9)
+INVERT_Y = False
+# Pixels this close to the image edge mean the arm enters the frame there
+BORDER_MARGIN_PX = 4
+# Last part of the arm (as a share of its length) treated as the hand
+HAND_FRACTION = 0.25
+# Keep the last y for a few frames when a hand drops out
+HOLD_FRAMES = 5
+
+# 1€ filter: lower MIN_CUTOFF = less jitter, higher BETA = less lag
+ONE_EURO_MIN_CUTOFF = 1.0
+ONE_EURO_BETA = 20.0
+ONE_EURO_D_CUTOFF = 1.0
 
 
 def start_camera():
@@ -203,12 +222,121 @@ def find_blobs(mask, depth_mm):
         blobs.append({
             "bbox": tuple(stats[label, :4]),
             "center": tuple(centroids[label].astype(int)),
+            "hand": find_hand_point(pixels),
             "area": int(area),
             "depth_mm": float(np.median(blob_depth)) if blob_depth.size else 0.0,
         })
 
     blobs.sort(key=lambda blob: blob["area"], reverse=True)
     return clean, blobs
+
+
+def find_hand_point(pixels):
+    ys, xs = np.nonzero(pixels)
+    h, w = pixels.shape
+    m = BORDER_MARGIN_PX
+
+    on_border = (ys < m) | (ys >= h - m) | (xs < m) | (xs >= w - m)
+
+    # Only the hand is in view, so its centre is the hand
+    if not on_border.any():
+        return float(xs.mean()), float(ys.mean())
+
+    # The hand is the end of the arm farthest from where it enters the frame
+    entry_x = xs[on_border].mean()
+    entry_y = ys[on_border].mean()
+    reach = np.hypot(xs - entry_x, ys - entry_y)
+
+    tip = reach >= reach.max() * (1.0 - HAND_FRACTION)
+    return float(xs[tip].mean()), float(ys[tip].mean())
+
+
+class OneEuroFilter:
+    # Casiez et al. 2012: smooths hard when still, follows fast moves
+    def __init__(self, min_cutoff=ONE_EURO_MIN_CUTOFF, beta=ONE_EURO_BETA,
+                 d_cutoff=ONE_EURO_D_CUTOFF):
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.reset()
+
+    def reset(self):
+        self.value = None
+        self.speed = 0.0
+        self.time = None
+
+    @staticmethod
+    def _alpha(cutoff, dt):
+        tau = 1.0 / (2.0 * np.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def __call__(self, value, timestamp):
+        if self.value is None:
+            self.value, self.time = value, timestamp
+            return value
+
+        dt = max(timestamp - self.time, 1e-3)
+        self.time = timestamp
+
+        speed = (value - self.value) / dt
+        self.speed += self._alpha(self.d_cutoff, dt) * (speed - self.speed)
+
+        cutoff = self.min_cutoff + self.beta * abs(self.speed)
+        self.value += self._alpha(cutoff, dt) * (value - self.value)
+        return self.value
+
+
+class HandTracker:
+    def __init__(self, lanes=NUM_LANES):
+        self.lanes = lanes
+        self.filters = [OneEuroFilter() for _ in range(lanes)]
+        self.y = [None] * lanes
+        self.raw_points = [None] * lanes
+        self.missing = [0] * lanes
+
+    def reset(self):
+        for lane in range(self.lanes):
+            self.filters[lane].reset()
+            self.y[lane] = None
+            self.raw_points[lane] = None
+            self.missing[lane] = 0
+
+    def update(self, blobs, width, height, timestamp):
+        lane_width = width / self.lanes
+        found = [None] * self.lanes
+
+        # Blobs are sorted by area, so each lane keeps its biggest hand
+        for blob in blobs:
+            hand_x, hand_y = blob["hand"]
+            lane = min(int(hand_x // lane_width), self.lanes - 1)
+
+            if found[lane] is None:
+                found[lane] = (hand_x, hand_y)
+
+        low, high = PLAY_Y_RANGE
+
+        for lane, point in enumerate(found):
+            self.raw_points[lane] = point
+
+            if point is None:
+                self.missing[lane] += 1
+
+                if self.missing[lane] > HOLD_FRAMES:
+                    self.y[lane] = None
+                    self.filters[lane].reset()
+                continue
+
+            self.missing[lane] = 0
+
+            y = point[1] / (height - 1)
+            y = float(np.clip((y - low) / (high - low), 0.0, 1.0))
+
+            if INVERT_Y:
+                y = 1.0 - y
+
+            self.y[lane] = self.filters[lane](y, timestamp)
+
+        return list(self.y)
 
 
 class DepthBackground:
@@ -345,6 +473,44 @@ def draw_blobs(image, blobs):
         )
 
 
+def draw_hands(image, tracker):
+    h, w = image.shape[:2]
+    lane_width = w / tracker.lanes
+    low, high = PLAY_Y_RANGE
+
+    for lane in range(1, tracker.lanes):
+        x = int(lane * lane_width)
+        cv2.line(image, (x, 0), (x, h), (255, 255, 255), 1)
+
+    for lane, y in enumerate(tracker.y):
+        x0 = int(lane * lane_width)
+        x1 = int((lane + 1) * lane_width)
+
+        point = tracker.raw_points[lane]
+        if point is not None:
+            cv2.circle(
+                image, (int(point[0]), int(point[1])), 5, (0, 0, 255), -1
+            )
+
+        if y is None:
+            continue
+
+        # Convert the smoothed 0..1 value back to a row for display
+        shown = 1.0 - y if INVERT_Y else y
+        row = int((low + shown * (high - low)) * (h - 1))
+
+        cv2.line(image, (x0 + 4, row), (x1 - 4, row), (0, 255, 255), 3)
+        cv2.putText(
+            image,
+            f"y={y:.2f}",
+            (x0 + 8, max(row - 8, 14)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 255),
+            1,
+        )
+
+
 def main():
     pipeline = None
 
@@ -367,6 +533,7 @@ def main():
         )
 
         colorizer = rs.colorizer()
+        tracker = HandTracker()
 
         print("Press 'b' to recapture the background, 'q' to quit.")
 
@@ -382,23 +549,29 @@ def main():
             closer, mask, blobs = background.segment(blurred)
             background.update(blurred)
 
+            h, w = current.shape
+
+            hand_y = tracker.update(blobs, w, h, time.perf_counter())
+
             # Display filtered depth
             depth_view = np.asanyarray(
                 colorizer.colorize(depth_frame).get_data()
             )
             draw_blobs(depth_view, blobs)
+            draw_hands(depth_view, tracker)
 
             # Visualize how much closer than the background, in millimeters
             diff_view = np.clip(
                 closer * 255.0 / 200.0, 0, 255
             ).astype(np.uint8)
 
-            h, w = current.shape
-            distance_m = current[h // 2, w // 2] / 1000.0
+            hands_text = "  ".join(
+                "--" if y is None else f"{y:.2f}" for y in hand_y
+            )
 
             cv2.putText(
                 depth_view,
-                f"Center: {distance_m:.2f} m  Blobs: {len(blobs)}",
+                f"Hands y: {hands_text}",
                 (20, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
@@ -420,6 +593,7 @@ def main():
                     pipeline, filters, depth_sensor, depth_scale, fx,
                     wait_for_user=False,
                 )
+                tracker.reset()
                 continue
 
             names = [
