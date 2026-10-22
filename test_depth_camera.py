@@ -8,6 +8,7 @@ import pyrealsense2 as rs
 
 # 848x480 is the D435's optimal depth resolution (Intel tuning guide)
 WIDTH, HEIGHT, FPS = 848, 480, 30
+DECIMATION = 2
 
 # Play area: anything outside this depth band is ignored
 MIN_DEPTH_M = 0.3
@@ -44,16 +45,36 @@ BG_LEARNING_RATE = 0.01
 
 MIN_BLOB_AREA = 150
 
-# Hand tracking (top-down view): each hand reports its z, the height above
-# the background (table/floor). Hands are told apart by their x position.
+# Hand tracking (top-down view, whole body in frame). Hands are geodesic
+# extrema: the body points farthest from the torso when walking along the
+# body's surface (Plagemann et al., ICRA 2010). Each hand reports its z,
+# the height above the background (floor).
 NUM_HANDS = 2
-# Height above the background (mm) mapped to z = 0..1
-HAND_HEIGHT_RANGE_MM = (30.0, 400.0)
-# Pixels this close to the image edge mean the arm enters the frame there
-BORDER_MARGIN_PX = 4
-# Last part of the arm (as a share of its length) treated as the hand
-HAND_FRACTION = 0.25
-# Keep the last y for a few frames when a hand drops out
+# Height above the background (mm) mapped to z = 0..1 (waist -> overhead)
+HAND_HEIGHT_RANGE_MM = (800.0, 2000.0)
+# Extrema to look for per body: head, hands and feet, plus spares for
+# elbows and shoulder corners, which are found too and then rejected
+MAX_EXTREMA = 8
+# Stop once the next extremum sticks out less than this from the rest
+MIN_EXTREMUM_MM = 120.0
+# Extrema closer to the torso than this are the head, shoulders or hands
+# held against the body
+MIN_HAND_REACH_MM = 350.0
+# A hand must be the far end of its limb, within this tolerance
+TIP_TOLERANCE_MM = 40.0
+# Extrema lower than this above the floor are feet
+MIN_HAND_HEIGHT_MM = 300.0
+# Part of the limb around the tip averaged into the hand position
+HAND_LENGTH_MM = 150.0
+# Depth steps bigger than this are walls for the geodesic walk, so an arm
+# held over the body connects at the shoulder, not through the chest
+# (0 disables)
+DEPTH_JUMP_MM = 100.0
+# Torso = the thickest part of the body (share of the max thickness)
+TORSO_CORE = 0.8
+# A tracked hand may move at most this far between frames to keep its id
+MAX_HAND_JUMP_PX = 60.0
+# Keep the last z for a few frames when a hand drops out
 HOLD_FRAMES = 5
 
 # 1€ filter: lower MIN_CUTOFF = less jitter, higher BETA = less lag
@@ -80,7 +101,7 @@ def start_camera():
 
     # Recommended order from the librealsense post-processing docs
     decimation = rs.decimation_filter()
-    decimation.set_option(rs.option.filter_magnitude, 2)
+    decimation.set_option(rs.option.filter_magnitude, DECIMATION)
 
     threshold = rs.threshold_filter()
     threshold.set_option(rs.option.min_distance, MIN_DEPTH_M)
@@ -199,7 +220,7 @@ def preprocess_depth(depth_mm):
     return blurred
 
 
-def find_blobs(mask, depth_mm, closer_mm):
+def find_blobs(mask, depth_mm, closer_mm, focal_px):
     count, labels, stats, centroids = cv2.connectedComponentsWithStats(
         mask, connectivity=8
     )
@@ -217,47 +238,160 @@ def find_blobs(mask, depth_mm, closer_mm):
         clean[pixels] = 255
 
         blob_depth = depth_mm[pixels & (depth_mm > 0)]
+        median_depth = float(np.median(blob_depth)) if blob_depth.size else 0.0
 
-        hand, tip = find_hand(pixels)
-
-        # Median over the hand pixels is robust to noisy fingers and edges
-        tip_height = closer_mm[tip][closer_mm[tip] > 0]
-
-        blobs.append({
+        blob = {
             "bbox": tuple(stats[label, :4]),
             "center": tuple(centroids[label].astype(int)),
-            "hand": hand,
-            "hand_height_mm": (
-                float(np.median(tip_height)) if tip_height.size else None
-            ),
             "area": int(area),
-            "depth_mm": float(np.median(blob_depth)) if blob_depth.size else 0.0,
-        })
+            "depth_mm": median_depth,
+            "torso": None,
+            "extrema": [],
+            "hands": [],
+        }
+
+        if median_depth > 0:
+            # Size of one pixel at the body's distance from the camera
+            mm_per_px = median_depth / focal_px
+            find_extrema(
+                blob, pixels, depth_mm, closer_mm, mm_per_px
+            )
+
+        blobs.append(blob)
 
     blobs.sort(key=lambda blob: blob["area"], reverse=True)
     return clean, blobs
 
 
-def find_hand(pixels):
-    ys, xs = np.nonzero(pixels)
-    h, w = pixels.shape
-    m = BORDER_MARGIN_PX
+CROSS_KERNEL = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+SQUARE_KERNEL = np.ones((3, 3), np.uint8)
 
-    on_border = (ys < m) | (ys >= h - m) | (xs < m) | (xs >= w - m)
 
-    if on_border.any():
-        # The hand is the end of the arm farthest from where it enters
-        entry_x = xs[on_border].mean()
-        entry_y = ys[on_border].mean()
-        reach = np.hypot(xs - entry_x, ys - entry_y)
-        keep = reach >= reach.max() * (1.0 - HAND_FRACTION)
-    else:
-        # Only the hand is in view
-        keep = np.ones(xs.shape, dtype=bool)
+def geodesic_distance(walkable, seeds, current=None):
+    # Grow outward from the seeds one ring at a time, only over walkable
+    # pixels. Alternating cross/square steps approximates true distance.
+    # With `current`, growth stops where it cannot beat the old distance.
+    dist = np.full(walkable.shape, np.inf, dtype=np.float32)
 
-    tip = (ys[keep], xs[keep])
-    point = (float(xs[keep].mean()), float(ys[keep].mean()))
-    return point, tip
+    front = seeds & walkable
+    reached = front.copy()
+    dist[front] = 0
+    step = 0
+
+    while True:
+        step += 1
+        kernel = CROSS_KERNEL if step % 2 else SQUARE_KERNEL
+
+        grown = cv2.dilate(front.astype(np.uint8), kernel) > 0
+        front = grown & walkable & ~reached
+
+        if current is not None:
+            front &= current > step
+
+        if not front.any():
+            return dist
+
+        dist[front] = step
+        reached |= front
+
+
+def find_extrema(blob, pixels, depth_mm, closer_mm, mm_per_px):
+    # Work on the blob's bounding box only, it is much faster
+    x, y, w, h = blob["bbox"]
+    body = pixels[y:y + h, x:x + w]
+    depth = depth_mm[y:y + h, x:x + w]
+    height = closer_mm[y:y + h, x:x + w]
+
+    walkable = body.copy()
+
+    if DEPTH_JUMP_MM > 0:
+        # Fill small holes and the 1 px ring around the body first, or
+        # every hole and the body outline would count as a depth jump
+        surface = np.where(body & (depth > 0), depth, 0).astype(np.float32)
+        grown = cv2.dilate(surface, SQUARE_KERNEL)
+        surface = np.where(surface > 0, surface, grown)
+
+        jump = cv2.morphologyEx(surface, cv2.MORPH_GRADIENT, SQUARE_KERNEL)
+        walkable &= jump < DEPTH_JUMP_MM
+
+    # Torso and arms are the biggest connected piece. The head is cut off
+    # by the jump at the neck and is left out, so it can't be the torso.
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        walkable.astype(np.uint8), connectivity=8
+    )
+
+    if count < 2:
+        return
+
+    walkable = labels == 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+
+    # Seen from above, the torso is the thickest part of the body. Measured
+    # on the walkable area so an arm lying over the chest is not counted.
+    thickness = cv2.distanceTransform(
+        walkable.astype(np.uint8), cv2.DIST_L2, 5
+    )
+    torso = walkable & (thickness >= TORSO_CORE * thickness.max())
+
+    torso_y, torso_x = np.nonzero(torso)
+    blob["torso"] = (float(torso_x.mean() + x), float(torso_y.mean() + y))
+
+    from_torso = geodesic_distance(walkable, torso)
+    dist = from_torso.copy()
+
+    hand_steps = HAND_LENGTH_MM / mm_per_px
+
+    for _ in range(MAX_EXTREMA):
+        reachable = np.where(np.isfinite(dist), dist, -1.0)
+        tip_index = np.argmax(reachable)
+        tip_steps = reachable.flat[tip_index]
+
+        # Nothing left that sticks out of the body
+        if tip_steps * mm_per_px < MIN_EXTREMUM_MM:
+            break
+
+        tip = np.zeros(walkable.shape, dtype=bool)
+        tip.flat[tip_index] = True
+
+        # AGEX: the next extremum is the point farthest from the torso
+        # AND from every extremum found so far
+        from_tip = geodesic_distance(walkable, tip, current=dist)
+        dist = np.minimum(dist, from_tip)
+
+        region = from_tip <= hand_steps
+        region_y, region_x = np.nonzero(region)
+        region_height = height[region]
+        region_height = region_height[region_height > 0]
+
+        reach_mm = float(from_torso.flat[tip_index] * mm_per_px)
+        height_mm = (
+            float(np.median(region_height)) if region_height.size else None
+        )
+
+        # Nothing around a real tip reaches farther from the torso. The
+        # middle of an arm fails this: the hand side reaches farther.
+        farthest_mm = float(from_torso[region].max() * mm_per_px)
+        is_tip = farthest_mm <= reach_mm + TIP_TOLERANCE_MM
+
+        if reach_mm < MIN_HAND_REACH_MM:
+            kind = "body"
+        elif not is_tip:
+            kind = "limb"
+        elif height_mm is None or height_mm < MIN_HAND_HEIGHT_MM:
+            kind = "foot"
+        else:
+            kind = "hand"
+
+        extremum = {
+            "point": (float(region_x.mean() + x), float(region_y.mean() + y)),
+            "height_mm": height_mm,
+            "reach_mm": reach_mm,
+            "kind": kind,
+        }
+
+        blob["extrema"].append(extremum)
+
+        if kind == "hand":
+            blob["hands"].append(extremum)
 
 
 class OneEuroFilter:
@@ -308,42 +442,51 @@ class HandTracker:
         self.z = [None] * self.hands
         self.height_mm = [None] * self.hands
         self.points = [None] * self.hands
-        self.last_x = [None] * self.hands
+        self.last_points = [None] * self.hands
         self.missing = [0] * self.hands
 
-    def _assign(self, found, width):
+    def _assign(self, found):
         slots = [None] * self.hands
+        unmatched = list(found)
 
-        # Everyone visible: number the hands left to right
-        if len(found) == self.hands:
-            ordered = sorted(found, key=lambda blob: blob["hand"][0])
-            return ordered
+        # Each hand keeps the id of the hand it was nearest to last frame,
+        # so ids survive the player turning around
+        pairs = []
+        for slot, last in enumerate(self.last_points):
+            if last is None:
+                continue
+            for hand in found:
+                gap = np.hypot(
+                    hand["point"][0] - last[0], hand["point"][1] - last[1]
+                )
+                if gap <= MAX_HAND_JUMP_PX:
+                    pairs.append((gap, slot, hand))
 
-        # Otherwise each hand takes the free slot it was last seen nearest to
-        for blob in found:
-            x = blob["hand"][0]
+        for _, slot, hand in sorted(pairs, key=lambda pair: pair[0]):
+            if slots[slot] is None and any(h is hand for h in unmatched):
+                slots[slot] = hand
+                unmatched = [h for h in unmatched if h is not hand]
 
-            def distance(slot):
-                last = self.last_x[slot]
-                if last is None:
-                    last = (slot + 0.5) * width / self.hands
-                return abs(x - last)
-
-            free = [slot for slot in range(self.hands) if slots[slot] is None]
-            slots[min(free, key=distance)] = blob
+        # New hands fill the free ids left to right
+        unmatched.sort(key=lambda hand: hand["point"][0])
+        for slot in range(self.hands):
+            if slots[slot] is None and unmatched:
+                slots[slot] = unmatched.pop(0)
 
         return slots
 
-    def update(self, blobs, width, timestamp):
-        # Blobs are sorted by area, so the biggest ones are the hands
-        found = [
-            blob for blob in blobs if blob["hand_height_mm"] is not None
-        ][:self.hands]
+    def update(self, blobs, timestamp):
+        # Hands that reach farthest from their torso are the most reliable
+        found = sorted(
+            (hand for blob in blobs for hand in blob["hands"]),
+            key=lambda hand: hand["reach_mm"],
+            reverse=True,
+        )[:self.hands]
 
         low, high = HAND_HEIGHT_RANGE_MM
 
-        for slot, blob in enumerate(self._assign(found, width)):
-            if blob is None:
+        for slot, hand in enumerate(self._assign(found)):
+            if hand is None:
                 self.points[slot] = None
                 self.missing[slot] += 1
 
@@ -354,11 +497,11 @@ class HandTracker:
                 continue
 
             self.missing[slot] = 0
-            self.points[slot] = blob["hand"]
-            self.last_x[slot] = blob["hand"][0]
-            self.height_mm[slot] = blob["hand_height_mm"]
+            self.points[slot] = hand["point"]
+            self.last_points[slot] = hand["point"]
+            self.height_mm[slot] = hand["height_mm"]
 
-            z = (blob["hand_height_mm"] - low) / (high - low)
+            z = (hand["height_mm"] - low) / (high - low)
             z = float(np.clip(z, 0.0, 1.0))
 
             self.z[slot] = self.filters[slot](z, timestamp)
@@ -385,6 +528,9 @@ class DepthBackground:
 
         self.mask = np.zeros(depth_mm.shape, dtype=bool)
 
+        # Focal length at the decimated resolution, to turn pixels into mm
+        self.focal_px = fx / DECIMATION
+
     def segment(self, current):
         valid = current > 0
         compare = valid & self.stable
@@ -407,7 +553,7 @@ class DepthBackground:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, MORPH_KERNEL)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, MORPH_KERNEL)
 
-        mask, blobs = find_blobs(mask, current, closer)
+        mask, blobs = find_blobs(mask, current, closer, self.focal_px)
         self.mask = mask > 0
 
         return closer, mask, blobs
@@ -499,6 +645,31 @@ def draw_blobs(image, blobs):
             1,
         )
 
+        if blob["torso"] is not None:
+            tx, ty = (int(v) for v in blob["torso"])
+            cv2.drawMarker(image, (tx, ty), (255, 255, 255),
+                           cv2.MARKER_CROSS, 12, 2)
+
+            # Every extremum, linked to the torso, to help tune the limits
+            for extremum in blob["extrema"]:
+                ex, ey = (int(v) for v in extremum["point"])
+                color = (255, 255, 255) if extremum["kind"] == "hand" \
+                    else (128, 128, 128)
+
+                cv2.line(image, (tx, ty), (ex, ey), color, 1)
+                cv2.circle(image, (ex, ey), 3, color, -1)
+
+                if extremum["kind"] != "hand":
+                    cv2.putText(
+                        image,
+                        extremum["kind"],
+                        (ex + 5, ey + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.35,
+                        color,
+                        1,
+                    )
+
 
 HAND_COLORS = [(0, 255, 255), (255, 0, 255), (255, 255, 0), (0, 128, 255)]
 
@@ -573,9 +744,7 @@ def main():
             closer, mask, blobs = background.segment(blurred)
             background.update(blurred)
 
-            h, w = current.shape
-
-            hand_z = tracker.update(blobs, w, time.perf_counter())
+            hand_z = tracker.update(blobs, time.perf_counter())
 
             # Display filtered depth
             depth_view = np.asanyarray(
