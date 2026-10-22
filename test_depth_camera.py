@@ -45,8 +45,9 @@ BG_LEARNING_RATE = 0.01
 
 MIN_BLOB_AREA = 150
 
-# Hand tracking (top-down view): the image is split into vertical lanes,
-# one hand per lane, and only the hand's y position is reported (0 = top)
+# Hand tracking (top-down view): every blob can hold several hands, the
+# image is split into vertical lanes, one hand per lane, and only the
+# hand's y position is reported (0 = top)
 NUM_LANES = 2
 # Remap this part of the image height to the full 0..1 range
 PLAY_Y_RANGE = (0.1, 0.9)
@@ -57,6 +58,12 @@ BORDER_MARGIN_PX = 4
 HAND_LENGTH_MM = 180.0
 # Palm centre = average of points at least this share of the widest spot
 PALM_PEAK_RATIO = 0.85
+# Something must stick this far into the frame to count as a hand
+MIN_REACH_MM = 80.0
+# A second hand in the same blob (e.g. both arms joined through the body)
+# must stick out at least this far from the rest of the blob
+MIN_BRANCH_MM = 200.0
+MAX_HANDS_PER_BLOB = 4
 # Keep the last y for a few frames when a hand drops out
 HOLD_FRAMES = 5
 
@@ -225,7 +232,7 @@ def find_blobs(mask, depth_mm, fx):
         blobs.append({
             "bbox": tuple(stats[label, :4]),
             "center": tuple(centroids[label].astype(int)),
-            "hand": find_hand_point(pixels, depth_mm, fx),
+            "hands": find_hands(pixels, depth_mm, fx),
             "area": int(area),
             "depth_mm": float(np.median(blob_depth)) if blob_depth.size else 0.0,
         })
@@ -261,7 +268,12 @@ def geodesic_distance(blob, seeds):
         reached = grown
 
 
-def find_hand_point(pixels, depth_mm, fx):
+def component_at(mask, y, x):
+    _, labels = cv2.connectedComponents(mask.astype(np.uint8), connectivity=8)
+    return labels == labels[y, x]
+
+
+def find_hands(pixels, depth_mm, fx):
     h, w = pixels.shape
     m = BORDER_MARGIN_PX
 
@@ -272,45 +284,73 @@ def find_hand_point(pixels, depth_mm, fx):
     blob = pixels[y0:y1, x0:x1]
     depth = depth_mm[y0:y1, x0:x1]
 
-    border = np.zeros((h, w), dtype=bool)
-    border[:m, :] = border[-m:, :] = True
-    border[:, :m] = border[:, -m:] = True
-    entry = blob & border[y0:y1, x0:x1]
+    valid = blob & (depth > 0)
+    blob_z = float(np.median(depth[valid])) if valid.any() else 1500.0
+    z = np.where(depth > 0, depth, blob_z)
 
-    # Distance to the blob edge: peaks in the middle of the palm
-    inside = cv2.distanceTransform(
-        blob.astype(np.uint8), cv2.DIST_L2, 5
+    # The D435 has no depth in a band on the left edge (wider for closer
+    # objects), so an arm from the left stops short of the image border
+    rows = np.arange(y0, y1)[:, None]
+    cols = np.arange(x0, x1)[None, :]
+    left_band = fx * D435_BASELINE_MM / z
+    entry = blob & (
+        (cols < m + left_band) | (cols >= w - m)
+        | (rows < m) | (rows >= h - m)
     )
 
-    if entry.any():
-        # The fingertip is the point farthest along the arm from the entry
-        reach = geodesic_distance(blob, entry)
-        far = reach.max()
+    # Distance to the blob edge: peaks in the middle of the palm
+    inside = cv2.distanceTransform(blob.astype(np.uint8), cv2.DIST_L2, 5)
 
-        tip_zone = reach >= far - 2.0
-        tip_y, tip_x = np.nonzero(tip_zone)
+    if not entry.any():
+        # Nothing comes in from outside (a lone hand, or a whole person in
+        # view), so measure from the thickest part instead
+        entry = blob & (inside >= inside.max())
 
-        # Hand length in pixels at the hand's own depth
-        tip_depth = depth[tip_zone & (depth > 0)]
-        z = float(np.median(tip_depth)) if tip_depth.size else 1000.0
-        hand_px = HAND_LENGTH_MM * fx / max(z, 1.0)
+    reach = geodesic_distance(blob, entry)
 
-        hand = blob & (reach >= far - hand_px)
-    else:
-        # Only the hand is in view
-        hand = blob
-        tip_y, tip_x = np.nonzero(inside == inside.max())
+    # Hands are the tips that stick out. Walk from the farthest point down:
+    # a tip only counts if, going MIN_BRANCH_MM back towards the entry, it
+    # does not join something that reaches farther. So fingers, elbows and
+    # the sides of the body are skipped, but a second arm is kept.
+    hands = []
+    todo = blob & (reach >= 0)
 
-    # Palm centre: the widest spot of the hand, averaged for stability
-    palm_dist = np.where(hand, inside, 0.0)
-    best = palm_dist.max()
-    palm_y, palm_x = np.nonzero(palm_dist >= best * PALM_PEAK_RATIO)
+    while todo.any() and len(hands) < MAX_HANDS_PER_BLOB:
+        ty, tx = np.unravel_index(
+            np.where(todo, reach, -1.0).argmax(), reach.shape
+        )
+        top = reach[ty, tx]
+        px_per_mm = fx / z[ty, tx]
 
-    return {
-        "palm": (float(palm_x.mean() + x0), float(palm_y.mean() + y0)),
-        "tip": (float(tip_x.mean() + x0), float(tip_y.mean() + y0)),
-        "radius": float(best),
-    }
+        # Everything left is shorter, so nothing more sticks in far enough
+        if top < MIN_REACH_MM * px_per_mm:
+            break
+
+        branch = component_at(
+            blob & (reach >= top - MIN_BRANCH_MM * px_per_mm), ty, tx
+        )
+        todo &= ~branch
+
+        if reach[branch].max() > top:
+            continue
+
+        hand = component_at(
+            blob & (reach >= top - HAND_LENGTH_MM * px_per_mm), ty, tx
+        )
+        tip_y, tip_x = np.nonzero(hand & (reach >= top - 2.0))
+
+        # Palm centre: the widest spot of the hand, averaged for stability
+        palm_dist = np.where(hand, inside, 0.0)
+        best = palm_dist.max()
+        palm_y, palm_x = np.nonzero(palm_dist >= best * PALM_PEAK_RATIO)
+
+        hands.append({
+            "palm": (float(palm_x.mean() + x0), float(palm_y.mean() + y0)),
+            "tip": (float(tip_x.mean() + x0), float(tip_y.mean() + y0)),
+            "radius": float(best),
+        })
+
+    return hands
 
 
 class OneEuroFilter:
@@ -354,26 +394,49 @@ class HandTracker:
         self.filters = [OneEuroFilter() for _ in range(lanes)]
         self.y = [None] * lanes
         self.raw_points = [None] * lanes
+        # Last hand each lane followed, kept through short dropouts
+        self.last = [None] * lanes
         self.missing = [0] * lanes
+        # Every hand seen this frame, also the ones no lane picked
+        self.hands = []
 
     def reset(self):
         for lane in range(self.lanes):
             self.filters[lane].reset()
             self.y[lane] = None
             self.raw_points[lane] = None
+            self.last[lane] = None
             self.missing[lane] = 0
+        self.hands = []
+
+    def pick(self, lane, candidates):
+        if not candidates:
+            return None
+
+        # Stick with the hand nearest to last frame's, so a second hand
+        # entering the lane does not steal it
+        last = self.last[lane]
+        if last is None:
+            return candidates[0]
+
+        return min(
+            candidates,
+            key=lambda hand: np.hypot(
+                hand["palm"][0] - last["palm"][0],
+                hand["palm"][1] - last["palm"][1],
+            ),
+        )
 
     def update(self, blobs, width, height, timestamp):
         lane_width = width / self.lanes
-        found = [None] * self.lanes
+        self.hands = [hand for blob in blobs for hand in blob["hands"]]
 
-        # Blobs are sorted by area, so each lane keeps its biggest hand
-        for blob in blobs:
-            hand_x, hand_y = blob["hand"]["palm"]
-            lane = min(int(hand_x // lane_width), self.lanes - 1)
+        in_lane = [[] for _ in range(self.lanes)]
+        for hand in self.hands:
+            lane = min(int(hand["palm"][0] // lane_width), self.lanes - 1)
+            in_lane[lane].append(hand)
 
-            if found[lane] is None:
-                found[lane] = blob["hand"]
+        found = [self.pick(lane, in_lane[lane]) for lane in range(self.lanes)]
 
         low, high = PLAY_Y_RANGE
 
@@ -385,10 +448,12 @@ class HandTracker:
 
                 if self.missing[lane] > HOLD_FRAMES:
                     self.y[lane] = None
+                    self.last[lane] = None
                     self.filters[lane].reset()
                 continue
 
             self.missing[lane] = 0
+            self.last[lane] = point
 
             y = point["palm"][1] / (height - 1)
             y = float(np.clip((y - low) / (high - low), 0.0, 1.0))
@@ -547,22 +612,23 @@ def draw_hands(image, tracker):
         x = int(lane * lane_width)
         cv2.line(image, (x, 0), (x, h), (255, 255, 255), 1)
 
+    # Every detected hand: palm outline, palm centre and fingertip.
+    # Hands a lane uses are red, extra hands are grey.
+    for hand in tracker.hands:
+        used = any(hand is point for point in tracker.raw_points)
+        color = (0, 0, 255) if used else (160, 160, 160)
+
+        palm = tuple(int(v) for v in hand["palm"])
+        tip = tuple(int(v) for v in hand["tip"])
+
+        cv2.circle(image, palm, max(int(hand["radius"]), 3), color, 1)
+        cv2.circle(image, palm, 4, color, -1)
+        cv2.circle(image, tip, 3, (255, 0, 255), -1)
+        cv2.line(image, palm, tip, (255, 0, 255), 1)
+
     for lane, y in enumerate(tracker.y):
         x0 = int(lane * lane_width)
         x1 = int((lane + 1) * lane_width)
-
-        point = tracker.raw_points[lane]
-        if point is not None:
-            palm = tuple(int(v) for v in point["palm"])
-            tip = tuple(int(v) for v in point["tip"])
-
-            # Palm outline, palm centre and fingertip
-            cv2.circle(
-                image, palm, max(int(point["radius"]), 3), (0, 0, 255), 1
-            )
-            cv2.circle(image, palm, 4, (0, 0, 255), -1)
-            cv2.circle(image, tip, 3, (255, 0, 255), -1)
-            cv2.line(image, palm, tip, (255, 0, 255), 1)
 
         if y is None:
             continue
