@@ -8,6 +8,7 @@
 
 import time
 import urllib.request
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -57,6 +58,22 @@ ARM_REACH_MM = 600.0
 # A person may move at most this far between frames to keep their id
 MAX_PERSON_JUMP_PX = 150.0
 HOLD_FRAMES = 5
+
+# Consistency: people and hands are matched to where their last
+# HISTORY_FRAMES positions predict them to be, not to the model's labels
+HISTORY_FRAMES = 3
+# Never extrapolate further than this (s) after a track was last seen
+MAX_PREDICT_S = 0.2
+# Hands whose two possible pairings are this close (px) are too close to
+# call (hands together/crossing): keep the pairing of the recent frames
+SWAP_MARGIN_PX = 25.0
+# The model's Left/Right only renames a person's hands once it disagreed
+# in this share of the last LABEL_VOTE_FRAMES frames
+LABEL_VOTE_FRAMES = 15
+LABEL_SWAP_SHARE = 0.8
+# When matching people, every mm of difference in distance from the camera
+# counts as this many px: two people crossing at different depths keep ids
+PERSON_DEPTH_WEIGHT = 0.15
 
 # 1€ filter: lower MIN_CUTOFF = less jitter, higher BETA = less lag
 ONE_EURO_MIN_CUTOFF = 1.0
@@ -239,6 +256,20 @@ def read_people(result, camera, depth_raw, width, height):
     return people
 
 
+def predict(history, timestamp):
+    # Constant velocity from the oldest to the newest recent position
+    if not history:
+        return None
+
+    t1, p1 = history[-1]
+    if len(history) == 1:
+        return p1
+
+    t0, p0 = history[0]
+    velocity = (p1 - p0) / max(t1 - t0, 1e-3)
+    return p1 + velocity * min(timestamp - t1, MAX_PREDICT_S)
+
+
 class PersonTrack:
     def __init__(self, person_id, width, height):
         self.id = person_id
@@ -248,6 +279,14 @@ class PersonTrack:
         self.distance_mm = None
         self.hands = {side: None for side in HAND_LANDMARKS}
         self.hand_missing = {side: 0 for side in HAND_LANDMARKS}
+
+        # Recent raw positions (timestamp, point) for the predictions
+        self.center_history = deque(maxlen=HISTORY_FRAMES)
+        self.hand_history = {
+            side: deque(maxlen=HISTORY_FRAMES) for side in HAND_LANDMARKS
+        }
+        # Per frame: did the model's Left/Right come out swapped vs ours?
+        self.label_votes = deque(maxlen=LABEL_VOTE_FRAMES)
 
         # Positions are in pixels, so scale beta from 0..1 units
         point_beta = ONE_EURO_BETA / width
@@ -260,21 +299,86 @@ class PersonTrack:
             for side in HAND_LANDMARKS
         }
 
+    def predicted_center(self, timestamp):
+        return predict(self.center_history, timestamp)
+
+    def _usually_swapped(self):
+        return sum(self.label_votes) * 2 > len(self.label_votes)
+
+    def _pair_hands(self, detected, timestamp):
+        # Map the model's Left/Right onto this person's own hands by
+        # position, so a label the model flips for a frame changes nothing
+        straight = detected
+        crossed = {"Left": detected["Right"], "Right": detected["Left"]}
+
+        def gaps(pairing):
+            result = []
+            for side, hand in pairing.items():
+                guess = predict(self.hand_history[side], timestamp)
+                if hand is not None and guess is not None:
+                    result.append(float(np.hypot(*(hand["point"] - guess))))
+            return result
+
+        keep, swap = gaps(straight), gaps(crossed)
+
+        if keep and len(keep) == len(swap):
+            if sum(swap) + SWAP_MARGIN_PX < sum(keep):
+                swapped = True
+            elif sum(keep) + SWAP_MARGIN_PX < sum(swap):
+                swapped = False
+            else:
+                swapped = self._usually_swapped()
+        else:
+            # Nothing to compare (new hands): trust the recent frames, or
+            # the model's labels for a brand new person
+            swapped = self._usually_swapped()
+
+        self.label_votes.append(swapped)
+
+        # The model keeps disagreeing with us: our names were wrong, so
+        # rename our hands to its labels
+        if (
+            len(self.label_votes) == LABEL_VOTE_FRAMES
+            and sum(self.label_votes) >= LABEL_SWAP_SHARE * LABEL_VOTE_FRAMES
+        ):
+            self._rename_hands()
+            return straight
+
+        return crossed if swapped else straight
+
+    def _rename_hands(self):
+        for state in (
+            self.hands, self.hand_missing, self.hand_history,
+            self.point_filters, self.z_filters,
+        ):
+            state["Left"], state["Right"] = state["Right"], state["Left"]
+
+        self.label_votes.clear()
+
     def update(self, person, timestamp):
         self.missing = 0
-        self.center = np.array(person["center"])
+        self.center = np.array(person["center"], dtype=float)
+        self.center_history.append((timestamp, self.center))
         self.distance_mm = person["distance_mm"]
 
-        for side, hand in person["hands"].items():
+        detected = {
+            side: None if hand is None else {
+                **hand, "point": np.array(hand["point"], dtype=float)
+            }
+            for side, hand in person["hands"].items()
+        }
+
+        for side, hand in self._pair_hands(detected, timestamp).items():
             if hand is None:
                 self._lose_hand(side)
                 continue
 
             self.hand_missing[side] = 0
+            self.hand_history[side].append((timestamp, hand["point"]))
 
-            # The filter updates its array in place: hand it a fresh one
+            # The filter updates its array in place: hand it a copy
             x, y = self.point_filters[side](
-                np.array(hand["point"], dtype=float), timestamp
+                hand["point"].copy(), timestamp
             ).tolist()
 
             # Push: how far the hand is in front of the body. Without
@@ -303,6 +407,7 @@ class PersonTrack:
 
         if self.hand_missing[side] > HOLD_FRAMES:
             self.hands[side] = None
+            self.hand_history[side].clear()
             self.point_filters[side].reset()
             self.z_filters[side].reset()
 
@@ -314,16 +419,24 @@ class PeopleTracker:
         self.next_id = 1
 
     def update(self, people, timestamp):
-        # Each person keeps the id of the track nearest to them
+        # Each person keeps the id of the track predicted nearest to them,
+        # counting both position on screen and distance from the camera
         pairs = []
         for t_index, track in enumerate(self.tracks):
+            guess = track.predicted_center(timestamp)
             for p_index, person in enumerate(people):
-                gap = float(np.hypot(*(np.array(person["center"]) - track.center)))
+                gap = float(np.hypot(*(np.array(person["center"]) - guess)))
+                gap += PERSON_DEPTH_WEIGHT * abs(
+                    person["distance_mm"] - track.distance_mm
+                )
                 if gap <= MAX_PERSON_JUMP_PX:
-                    pairs.append((gap, t_index, p_index))
+                    pairs.append((track.missing, gap, t_index, p_index))
 
+        # People seen last frame are matched first: the predicted spot of
+        # someone hidden behind another player sweeps right through them
+        # and must not steal their detection
         used_tracks, used_people = set(), set()
-        for _, t_index, p_index in sorted(pairs):
+        for _, _, t_index, p_index in sorted(pairs):
             if t_index in used_tracks or p_index in used_people:
                 continue
             self.tracks[t_index].update(people[p_index], timestamp)
