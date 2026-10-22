@@ -8,6 +8,7 @@ import pyrealsense2 as rs
 
 # 848x480 is the D435's optimal depth resolution (Intel tuning guide)
 WIDTH, HEIGHT, FPS = 848, 480, 30
+DECIMATION = 2
 
 # Play area: anything outside this depth band is ignored
 MIN_DEPTH_M = 0.3
@@ -52,8 +53,10 @@ PLAY_Y_RANGE = (0.1, 0.9)
 INVERT_Y = False
 # Pixels this close to the image edge mean the arm enters the frame there
 BORDER_MARGIN_PX = 4
-# Last part of the arm (as a share of its length) treated as the hand
-HAND_FRACTION = 0.25
+# Real hand length (wrist to fingertip); converted to pixels per depth
+HAND_LENGTH_MM = 180.0
+# Palm centre = average of points at least this share of the widest spot
+PALM_PEAK_RATIO = 0.85
 # Keep the last y for a few frames when a hand drops out
 HOLD_FRAMES = 5
 
@@ -81,7 +84,7 @@ def start_camera():
 
     # Recommended order from the librealsense post-processing docs
     decimation = rs.decimation_filter()
-    decimation.set_option(rs.option.filter_magnitude, 2)
+    decimation.set_option(rs.option.filter_magnitude, DECIMATION)
 
     threshold = rs.threshold_filter()
     threshold.set_option(rs.option.min_distance, MIN_DEPTH_M)
@@ -200,7 +203,7 @@ def preprocess_depth(depth_mm):
     return blurred
 
 
-def find_blobs(mask, depth_mm):
+def find_blobs(mask, depth_mm, fx):
     count, labels, stats, centroids = cv2.connectedComponentsWithStats(
         mask, connectivity=8
     )
@@ -222,7 +225,7 @@ def find_blobs(mask, depth_mm):
         blobs.append({
             "bbox": tuple(stats[label, :4]),
             "center": tuple(centroids[label].astype(int)),
-            "hand": find_hand_point(pixels),
+            "hand": find_hand_point(pixels, depth_mm, fx),
             "area": int(area),
             "depth_mm": float(np.median(blob_depth)) if blob_depth.size else 0.0,
         })
@@ -231,24 +234,83 @@ def find_blobs(mask, depth_mm):
     return clean, blobs
 
 
-def find_hand_point(pixels):
-    ys, xs = np.nonzero(pixels)
+def geodesic_distance(blob, seeds):
+    # Grow from the entry one ring at a time, staying inside the blob, so a
+    # bent arm is measured along the arm and not straight across the gap.
+    # Alternating cross/square kernels gives a near-round distance.
+    blob = blob.astype(np.uint8)
+    reached = (seeds & (blob > 0)).astype(np.uint8)
+    dist = np.full(blob.shape, -1.0, dtype=np.float32)
+    dist[reached > 0] = 0.0
+
+    kernels = (
+        cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3)),
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+    )
+    step = 0
+
+    while True:
+        grown = cv2.dilate(reached, kernels[step % 2]) & blob
+        new = (grown > 0) & (reached == 0)
+
+        if not new.any():
+            return dist
+
+        step += 1
+        dist[new] = step
+        reached = grown
+
+
+def find_hand_point(pixels, depth_mm, fx):
     h, w = pixels.shape
     m = BORDER_MARGIN_PX
 
-    on_border = (ys < m) | (ys >= h - m) | (xs < m) | (xs >= w - m)
+    # Work on the blob's bounding box only, it is much faster
+    ys, xs = np.nonzero(pixels)
+    y0, y1 = ys.min(), ys.max() + 1
+    x0, x1 = xs.min(), xs.max() + 1
+    blob = pixels[y0:y1, x0:x1]
+    depth = depth_mm[y0:y1, x0:x1]
 
-    # Only the hand is in view, so its centre is the hand
-    if not on_border.any():
-        return float(xs.mean()), float(ys.mean())
+    border = np.zeros((h, w), dtype=bool)
+    border[:m, :] = border[-m:, :] = True
+    border[:, :m] = border[:, -m:] = True
+    entry = blob & border[y0:y1, x0:x1]
 
-    # The hand is the end of the arm farthest from where it enters the frame
-    entry_x = xs[on_border].mean()
-    entry_y = ys[on_border].mean()
-    reach = np.hypot(xs - entry_x, ys - entry_y)
+    # Distance to the blob edge: peaks in the middle of the palm
+    inside = cv2.distanceTransform(
+        blob.astype(np.uint8), cv2.DIST_L2, 5
+    )
 
-    tip = reach >= reach.max() * (1.0 - HAND_FRACTION)
-    return float(xs[tip].mean()), float(ys[tip].mean())
+    if entry.any():
+        # The fingertip is the point farthest along the arm from the entry
+        reach = geodesic_distance(blob, entry)
+        far = reach.max()
+
+        tip_zone = reach >= far - 2.0
+        tip_y, tip_x = np.nonzero(tip_zone)
+
+        # Hand length in pixels at the hand's own depth
+        tip_depth = depth[tip_zone & (depth > 0)]
+        z = float(np.median(tip_depth)) if tip_depth.size else 1000.0
+        hand_px = HAND_LENGTH_MM * fx / max(z, 1.0)
+
+        hand = blob & (reach >= far - hand_px)
+    else:
+        # Only the hand is in view
+        hand = blob
+        tip_y, tip_x = np.nonzero(inside == inside.max())
+
+    # Palm centre: the widest spot of the hand, averaged for stability
+    palm_dist = np.where(hand, inside, 0.0)
+    best = palm_dist.max()
+    palm_y, palm_x = np.nonzero(palm_dist >= best * PALM_PEAK_RATIO)
+
+    return {
+        "palm": (float(palm_x.mean() + x0), float(palm_y.mean() + y0)),
+        "tip": (float(tip_x.mean() + x0), float(tip_y.mean() + y0)),
+        "radius": float(best),
+    }
 
 
 class OneEuroFilter:
@@ -307,11 +369,11 @@ class HandTracker:
 
         # Blobs are sorted by area, so each lane keeps its biggest hand
         for blob in blobs:
-            hand_x, hand_y = blob["hand"]
+            hand_x, hand_y = blob["hand"]["palm"]
             lane = min(int(hand_x // lane_width), self.lanes - 1)
 
             if found[lane] is None:
-                found[lane] = (hand_x, hand_y)
+                found[lane] = blob["hand"]
 
         low, high = PLAY_Y_RANGE
 
@@ -328,7 +390,7 @@ class HandTracker:
 
             self.missing[lane] = 0
 
-            y = point[1] / (height - 1)
+            y = point["palm"][1] / (height - 1)
             y = float(np.clip((y - low) / (high - low), 0.0, 1.0))
 
             if INVERT_Y:
@@ -356,6 +418,9 @@ class DepthBackground:
         self.on_mm = np.maximum(K_SIGMA_ON * self.sigma, MIN_THRESHOLD_MM)
         self.off_mm = self.on_mm * (K_SIGMA_OFF / K_SIGMA_ON)
 
+        # The depth image is decimated, so its focal length shrinks too
+        self.fx_px = fx / DECIMATION
+
         self.mask = np.zeros(depth_mm.shape, dtype=bool)
 
     def segment(self, current):
@@ -380,7 +445,7 @@ class DepthBackground:
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, MORPH_KERNEL)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, MORPH_KERNEL)
 
-        mask, blobs = find_blobs(mask, current)
+        mask, blobs = find_blobs(mask, current, self.fx_px)
         self.mask = mask > 0
 
         return closer, mask, blobs
@@ -488,9 +553,16 @@ def draw_hands(image, tracker):
 
         point = tracker.raw_points[lane]
         if point is not None:
+            palm = tuple(int(v) for v in point["palm"])
+            tip = tuple(int(v) for v in point["tip"])
+
+            # Palm outline, palm centre and fingertip
             cv2.circle(
-                image, (int(point[0]), int(point[1])), 5, (0, 0, 255), -1
+                image, palm, max(int(point["radius"]), 3), (0, 0, 255), 1
             )
+            cv2.circle(image, palm, 4, (0, 0, 255), -1)
+            cv2.circle(image, tip, 3, (255, 0, 255), -1)
+            cv2.line(image, palm, tip, (255, 0, 255), 1)
 
         if y is None:
             continue
