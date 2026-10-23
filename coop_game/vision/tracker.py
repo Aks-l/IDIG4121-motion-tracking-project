@@ -10,6 +10,7 @@ import numpy as np
 
 from .. import config
 from .background import BackgroundModel
+from .bodies import body_grid
 from .filters import OneEuroFilter
 from .geometry import camera_to_world
 from .players import clean_mask, find_anchor, find_split, split_players
@@ -30,10 +31,15 @@ class TrackingResult:
     anchors: dict            # {1: Anchor or None, 2: Anchor or None}
     split: int
     debug: Optional[np.ndarray] = None
+    # Only with a body grid (see bodies.py): {1: grid or None, 2: ...}
+    bodies: Optional[dict] = None
+    time: float = 0.0        # time.perf_counter() when the frame arrived
 
 
 class PlayerTracker:
-    def __init__(self):
+    def __init__(self, body_spec=None):
+        # A bodies.GridSpec: also report each player's whole silhouette
+        self.body_spec = body_spec
         self.background = BackgroundModel()
         self.split = None
         self.filters = {
@@ -78,6 +84,14 @@ class PlayerTracker:
 
             anchors[pid] = self._smooth(pid, world, pixel, timestamp)
 
+        bodies = None
+        if self.body_spec is not None:
+            bodies = {
+                pid: None if player is None
+                else body_grid(player, depth, intrinsics, self.body_spec)
+                for pid, player in players.items()
+            }
+
         occupied = np.zeros(mask.shape, dtype=bool)
         for player in players.values():
             if player is not None:
@@ -85,7 +99,9 @@ class PlayerTracker:
         self.background.update(depth, occupied)
 
         image = self._debug_image(depth, players, anchors) if debug else None
-        return TrackingResult(anchors, int(round(self.split)), image)
+        return TrackingResult(
+            anchors, int(round(self.split)), image, bodies, timestamp
+        )
 
     def _smooth(self, pid, world, pixel, timestamp):
         if world is None:
@@ -130,13 +146,13 @@ class TrackerThread(threading.Thread):
     """Camera + tracking off the game loop: 60 fps rendering never waits
     for the 30 fps camera."""
 
-    def __init__(self):
+    def __init__(self, body_spec=None):
         super().__init__(daemon=True)
         # Imported here so the rest of vision/ works without pyrealsense2
         from .camera import DepthCamera
 
         self.camera = DepthCamera()
-        self.tracker = PlayerTracker()
+        self.tracker = PlayerTracker(body_spec)
         self.want_debug = False
         self.error = None
 
