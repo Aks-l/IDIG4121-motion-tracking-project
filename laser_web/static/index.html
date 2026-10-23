@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Laser Duel</title>
+  <!-- three.js from a CDN: the computer running the game needs internet.
+       For an offline show, download these two folders and point here. -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+      }
+    }
+  </script>
+  <style>
+    :root {
+      --laser: #ff5a6e;
+      --text: #ebebf5;
+      --dim: #9696aa;
+    }
+    [hidden] { display: none !important; }
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      background: #04060d;
+      color: var(--text);
+      font-family: system-ui, "Segoe UI", sans-serif;
+    }
+    #stage, #stage canvas { position: fixed; inset: 0; display: block; }
+    #hud { position: fixed; inset: 0; pointer-events: none; text-shadow: 2px 2px 0 #000; }
+    .panel {
+      position: absolute;
+      top: 16px;
+      width: 190px;
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 22px;
+      color: #fff;
+    }
+    #p1 { left: 20px; }
+    #p2 { right: 20px; }
+    .info { position: absolute; top: 60px; font-size: 20px; color: var(--dim); }
+    #p1-info { left: 24px; }
+    #p2-info { right: 24px; text-align: right; }
+    .centre { position: absolute; left: 0; right: 0; text-align: center; }
+    #timer { top: 20px; font-size: 24px; font-weight: 600; }
+    #status { top: 70px; font-size: 22px; }
+    #title { top: 28%; font-size: 96px; font-weight: 800; letter-spacing: 2px; }
+    #line1 { top: calc(28% + 125px); font-size: 24px; font-weight: 600; }
+    #line2 { top: calc(28% + 162px); font-size: 22px; color: var(--dim); }
+    #help { bottom: 24px; font-size: 18px; color: var(--dim); }
+    #debug { position: fixed; right: 20px; top: 100px; width: 360px; border: 1px solid #333; }
+    #boot-error { position: fixed; inset: 0; display: grid; place-items: center; font-size: 22px; padding: 16px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div id="stage"></div>
+  <div id="hud">
+    <div id="p1" class="panel"><span id="p1-label">P1</span></div>
+    <div id="p2" class="panel"><span id="p2-label">P2</span></div>
+    <div id="p1-info" class="info"></div>
+    <div id="p2-info" class="info"></div>
+    <div id="timer" class="centre"></div>
+    <div id="status" class="centre"></div>
+    <div id="title" class="centre"></div>
+    <div id="line1" class="centre"></div>
+    <div id="line2" class="centre"></div>
+    <div id="help" class="centre"></div>
+  </div>
+  <img id="debug" hidden alt="Camera debug view">
+  <div id="boot-error" hidden>
+    Couldn't start: three.js loads from the internet (cdn.jsdelivr.net).<br>
+    Check the connection, or open the browser console for the error.
+  </div>
+
+  <script type="module" src="js/main.js"></script>
+  <script>
+    // A module that fails to load fails silently: say so on screen
+    setTimeout(() => {
+      if (!window.laserDuelStarted) document.getElementById("boot-error").hidden = false;
+    }, 6000);
+  </script>
+</body>
+</html>
