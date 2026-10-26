@@ -40,9 +40,9 @@ FPlayerTracker::FPlayerTracker(const FRealSenseSettings& InSettings)
 {
 }
 
-void FPlayerTracker::CaptureBackground(const TArray<cv::Mat>& Frames, float FxFull)
+void FPlayerTracker::CaptureBackground(const std::vector<cv::Mat>& Frames, float FxFull)
 {
-	if (Frames.IsEmpty())
+	if (Frames.empty())
 	{
 		return;
 	}
@@ -54,7 +54,7 @@ void FPlayerTracker::CaptureBackground(const TArray<cv::Mat>& Frames, float FxFu
 
 	// Per-pixel median of the valid (non-zero) samples
 	TArray<float> Samples;
-	Samples.Reserve(Frames.Num());
+	Samples.Reserve(static_cast<int32>(Frames.size()));
 	for (int32 Y = 0; Y < Rows; ++Y)
 	{
 		for (int32 X = 0; X < Cols; ++X)

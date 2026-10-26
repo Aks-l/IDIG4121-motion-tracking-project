@@ -34,7 +34,8 @@ struct FRealSenseWorker::FImpl
 #endif
 
 	FPlayerTracker Tracker;
-	TArray<cv::Mat> BackgroundFrames;
+	// Not TArray: it relocates with memmove, and cv::Mat points into itself (size.p, step.p)
+	std::vector<cv::Mat> BackgroundFrames;
 	FOneEuroFilter Smoothers[2];
 	FRealSenseHandAnchor Last[2];
 	TArray<uint8> ColorBack;
@@ -215,11 +216,11 @@ uint32 FRealSenseWorker::Run()
 				}
 				if (bCapturing)
 				{
-					Impl->BackgroundFrames.Add(DepthMm.clone());
-					if (Impl->BackgroundFrames.Num() >= Settings.BackgroundFrames)
+					Impl->BackgroundFrames.push_back(DepthMm.clone());
+					if (static_cast<int32>(Impl->BackgroundFrames.size()) >= Settings.BackgroundFrames)
 					{
 						Impl->Tracker.CaptureBackground(Impl->BackgroundFrames, DepthIntrinsics.fx * Settings.Decimation);
-						Impl->BackgroundFrames.Reset();
+						Impl->BackgroundFrames.clear();
 						FScopeLock ScopeLock(&Lock);
 						BackgroundCaptureAt = -1.0;
 						UE_LOG(LogRealSense, Log, TEXT("Background captured"));

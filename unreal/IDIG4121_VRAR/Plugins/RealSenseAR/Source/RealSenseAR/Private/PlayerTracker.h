@@ -3,6 +3,8 @@
 #include "CoreMinimal.h"
 #include "RealSenseTypes.h"
 
+#include <vector>
+
 #include "PreOpenCVHeaders.h"
 #include <opencv2/core.hpp>
 #include "PostOpenCVHeaders.h"
@@ -35,7 +37,7 @@ public:
 	explicit FPlayerTracker(const FRealSenseSettings& InSettings);
 
 	/** Median of the empty room. FxFull = depth focal length at full (undecimated) resolution. */
-	void CaptureBackground(const TArray<cv::Mat>& Frames, float FxFull);
+	void CaptureBackground(const std::vector<cv::Mat>& Frames, float FxFull);
 	bool HasBackground() const { return !BgDepth.empty(); }
 
 	FResult Process(const cv::Mat& DepthMm);
