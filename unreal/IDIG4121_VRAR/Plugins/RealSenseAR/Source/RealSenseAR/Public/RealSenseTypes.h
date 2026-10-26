@@ -60,6 +60,22 @@ struct REALSENSEAR_API FRealSenseHandAnchor
 	double Timestamp = 0.0;
 };
 
+/** What the tracker made of its latest depth frame, shown next to the debug view. */
+struct FRealSenseTrackingStats
+{
+	/** The processed depth image (and debug image) size. */
+	int32 Width = 0;
+	int32 Height = 0;
+
+	/** Column dividing Player 1 (left) from Player 2. */
+	int32 Split = 0;
+
+	/** Largest region in each half, px. Below MinPlayerAreaPx it doesn't count as a player. */
+	int32 Areas[2] = { 0, 0 };
+
+	bool bAnchors[2] = { false, false };
+};
+
 UENUM(BlueprintType)
 enum class ERealSenseAnchorMode : uint8
 {

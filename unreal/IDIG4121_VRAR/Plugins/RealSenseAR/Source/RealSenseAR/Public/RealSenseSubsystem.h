@@ -61,6 +61,20 @@ public:
 	UFUNCTION(BlueprintPure, Category = "RealSense")
 	float GetBackgroundCountdown() const;
 
+	/** The tracking debug view: what the tracker sees. Costs a few ms per camera frame while on. */
+	UFUNCTION(BlueprintCallable, Category = "RealSense|Debug")
+	void SetDebugViewEnabled(bool bEnabled);
+
+	UFUNCTION(BlueprintPure, Category = "RealSense|Debug")
+	bool IsDebugViewEnabled() const { return bDebugView; }
+
+	/** BGRA8 at the processed depth resolution. Null until the first debug image arrived. */
+	UFUNCTION(BlueprintPure, Category = "RealSense|Debug")
+	UTexture2D* GetDebugTexture() const { return DebugTexture; }
+
+	/** The numbers behind the newest debug image. */
+	const FRealSenseTrackingStats& GetTrackingStats() const { return TrackingStats; }
+
 	const FRealSenseSettings& GetSettings() const { return Settings; }
 
 	// FTickableGameObject
@@ -71,6 +85,7 @@ public:
 
 private:
 	void UploadColorFrame();
+	void UploadDebugFrame();
 
 	FRealSenseSettings Settings;
 	// Shared, not unique: its deleter is bound in the .cpp, so this header can keep the type incomplete
@@ -82,6 +97,14 @@ private:
 	TArray<uint8> ColorPixels;
 	uint64 ColorSeq = 0;
 	FRealSenseHandAnchor CachedAnchors[2];
+
+	UPROPERTY(Transient)
+	TObjectPtr<UTexture2D> DebugTexture;
+
+	TArray<uint8> DebugPixels;
+	uint64 DebugSeq = 0;
+	FRealSenseTrackingStats TrackingStats;
+	bool bDebugView = false;
 
 	/** The automatic capture runs once per camera start. */
 	bool bAutoCaptureHandled = false;

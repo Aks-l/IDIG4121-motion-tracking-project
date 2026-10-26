@@ -6,6 +6,8 @@
 #include "InputCoreTypes.h"
 #include "RealSenseMirrorCamera.generated.h"
 
+class APlayerController;
+class UCanvas;
 class UMaterialInstanceDynamic;
 class UMaterialInterface;
 
@@ -73,6 +75,17 @@ public:
 	bool bShowStatus = true;
 
 	/**
+	 * What the tracker sees, in the bottom-left corner: depth with Player 1 tinted blue, Player 2 green,
+	 * foreground too small to be a player red, the split as a white line and the anchors circled.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RealSense|Debug")
+	bool bShowDebugView = false;
+
+	/** Toggles the debug view, like Tab in coop_game. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RealSense|Debug")
+	FKey DebugViewKey = EKeys::Tab;
+
+	/**
 	 * RealSense colour-camera point (metres, from FRealSenseHandAnchor::CameraPoint) -> Unreal world (cm).
 	 * This is the one function gameplay needs to put things on the players' hands.
 	 */
@@ -84,12 +97,17 @@ public:
 	bool GetHandWorldLocation(int32 PlayerId, FVector& OutLocation) const;
 
 	virtual void BeginPlay() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void Tick(float DeltaSeconds) override;
 
 private:
 	void ApplyIntrinsics();
 	void RecaptureBackground();
+	void ToggleDebugView();
 	void ShowStatus() const;
+	void DrawDebugView(UCanvas* Canvas, APlayerController* Player);
+
+	FDelegateHandle DebugDrawHandle;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> BackgroundMID;

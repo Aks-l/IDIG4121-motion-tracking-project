@@ -138,8 +138,9 @@ int32 FPlayerTracker::FindSplit(const cv::Mat& Mask) const
 	return Best;
 }
 
-cv::Mat FPlayerTracker::LargestRegion(const cv::Mat& Mask) const
+cv::Mat FPlayerTracker::LargestRegion(const cv::Mat& Mask, int32& OutArea) const
 {
+	OutArea = 0;
 	cv::Mat Labels, Stats, Centroids;
 	const int32 Count = cv::connectedComponentsWithStats(Mask, Labels, Stats, Centroids, 8, CV_32S);
 	if (Count < 2)
@@ -155,7 +156,8 @@ cv::Mat FPlayerTracker::LargestRegion(const cv::Mat& Mask) const
 			Best = Label;
 		}
 	}
-	if (Stats.at<int32>(Best, cv::CC_STAT_AREA) < Settings.MinPlayerAreaPx)
+	OutArea = Stats.at<int32>(Best, cv::CC_STAT_AREA);
+	if (OutArea < Settings.MinPlayerAreaPx)
 	{
 		return cv::Mat();
 	}
@@ -318,6 +320,7 @@ FPlayerTracker::FResult FPlayerTracker::Process(const cv::Mat& DepthMm)
 
 	FResult Result;
 	Result.Split = FMath::Clamp(FMath::RoundToInt(*SmoothedSplit), 0, Mask.cols);
+	Result.Foreground = Mask;
 
 	// Cut at the divider first, so two players touching hands still split
 	cv::Mat Halves[2] = { Mask.clone(), Mask.clone() };
@@ -327,14 +330,54 @@ FPlayerTracker::FResult FPlayerTracker::Process(const cv::Mat& DepthMm)
 	cv::Mat Occupied = cv::Mat::zeros(Mask.size(), CV_8U);
 	for (int32 Index = 0; Index < 2; ++Index)
 	{
-		const cv::Mat Player = LargestRegion(Halves[Index]);
+		const cv::Mat Player = LargestRegion(Halves[Index], Result.Areas[Index]);
 		if (!Player.empty())
 		{
 			Result.Anchors[Index] = FindAnchor(Player, DepthMm, Index);
+			Result.Players[Index] = Player;
 			Occupied |= Player;
 		}
 	}
 
 	UpdateBackground(DepthMm, Occupied);
 	return Result;
+}
+
+void FPlayerTracker::DrawDebug(const cv::Mat& DepthMm, const FResult& Result, cv::Mat& OutBGRA) const
+{
+	// Grey depth, near = bright, no depth = black
+	cv::Mat Grey;
+	DepthMm.convertTo(Grey, CV_8U, -255.0 / (Settings.FarM * 1000.0), 255.0);
+	Grey.setTo(0, DepthMm <= 0.f);
+	cv::cvtColor(Grey, OutBGRA, cv::COLOR_GRAY2BGRA);
+
+	const auto Tint = [&OutBGRA](const cv::Mat& Where, const cv::Scalar& Color)
+	{
+		cv::Mat Blend;
+		cv::addWeighted(OutBGRA, 0.4, cv::Mat(OutBGRA.size(), OutBGRA.type(), Color), 0.6, 0.0, Blend);
+		Blend.copyTo(OutBGRA, Where);
+	};
+
+	// Foreground that didn't make it into a player: too small, or not the biggest region in its half
+	cv::Mat Rejected = Result.Foreground.clone();
+	const cv::Scalar PlayerColors[2] = { cv::Scalar(255, 140, 40, 255), cv::Scalar(60, 200, 60, 255) };
+	for (int32 Index = 0; Index < 2; ++Index)
+	{
+		if (!Result.Players[Index].empty())
+		{
+			Rejected.setTo(0, Result.Players[Index]);
+			Tint(Result.Players[Index], PlayerColors[Index]);
+		}
+	}
+	Tint(Rejected, cv::Scalar(40, 40, 230, 255));
+
+	const cv::Scalar White(255, 255, 255, 255);
+	cv::line(OutBGRA, cv::Point(Result.Split, 0), cv::Point(Result.Split, OutBGRA.rows - 1), White, 1);
+	for (const TOptional<FAnchorPixel>& Anchor : Result.Anchors)
+	{
+		if (Anchor.IsSet())
+		{
+			cv::circle(OutBGRA, cv::Point(FMath::RoundToInt(Anchor->U), FMath::RoundToInt(Anchor->V)), 6, White, 2);
+		}
+	}
 }

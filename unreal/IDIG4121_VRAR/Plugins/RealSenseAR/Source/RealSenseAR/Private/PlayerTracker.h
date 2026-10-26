@@ -32,6 +32,11 @@ public:
 		/** [0] = Player 1 (left on screen), [1] = Player 2. */
 		TOptional<FAnchorPixel> Anchors[2];
 		int32 Split = 0;
+
+		// For the debug view
+		cv::Mat Foreground;            // CV_8U, cleaned: everything in front of the background
+		cv::Mat Players[2];            // CV_8U, empty when that half has no player
+		int32 Areas[2] = { 0, 0 };     // largest region per half, px, even when too small to count
 	};
 
 	explicit FPlayerTracker(const FRealSenseSettings& InSettings);
@@ -42,12 +47,18 @@ public:
 
 	FResult Process(const cv::Mat& DepthMm);
 
+	/**
+	 * coop_game's Tab view as BGRA8: grey depth (near = bright), players tinted blue / green,
+	 * foreground too small to be a player red, the split as a white line, anchors circled.
+	 */
+	void DrawDebug(const cv::Mat& DepthMm, const FResult& Result, cv::Mat& OutBGRA) const;
+
 private:
 	cv::Mat Foreground(const cv::Mat& DepthMm) const;
 	void UpdateBackground(const cv::Mat& DepthMm, const cv::Mat& Occupied);
 
 	int32 FindSplit(const cv::Mat& Mask) const;
-	cv::Mat LargestRegion(const cv::Mat& Mask) const;
+	cv::Mat LargestRegion(const cv::Mat& Mask, int32& OutArea) const;
 	cv::Mat UpperBody(const cv::Mat& Player) const;
 
 	TOptional<FAnchorPixel> FindAnchor(const cv::Mat& Player, const cv::Mat& DepthMm, int32 PlayerIndex) const;

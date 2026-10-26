@@ -1,9 +1,12 @@
 #include "RealSenseMirrorCamera.h"
 
 #include "Components/InputComponent.h"
+#include "Debug/DebugDrawService.h"
 #include "DrawDebugHelpers.h"
+#include "Engine/Canvas.h"
 #include "Engine/Engine.h"
 #include "Engine/GameInstance.h"
+#include "Engine/Texture2D.h"
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
 #include "Materials/MaterialInstanceDynamic.h"
@@ -54,10 +57,13 @@ void ARealSenseMirrorCamera::BeginPlay()
 		Player->SetViewTarget(this);
 		EnableInput(Player);
 		InputComponent->BindKey(RecaptureBackgroundKey, IE_Pressed, this, &ARealSenseMirrorCamera::RecaptureBackground);
+		InputComponent->BindKey(DebugViewKey, IE_Pressed, this, &ARealSenseMirrorCamera::ToggleDebugView);
 	}
 
 	URealSenseSubsystem* RealSense = GetGameInstance()->GetSubsystem<URealSenseSubsystem>();
 	bMirror = RealSense->GetSettings().bMirror;
+	RealSense->SetDebugViewEnabled(bShowDebugView);
+	DebugDrawHandle = UDebugDrawService::Register(TEXT("Game"), FDebugDrawDelegate::CreateUObject(this, &ARealSenseMirrorCamera::DrawDebugView));
 
 	if (BackgroundMaterial)
 	{
@@ -101,9 +107,71 @@ void ARealSenseMirrorCamera::Tick(float DeltaSeconds)
 	}
 }
 
+void ARealSenseMirrorCamera::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	UDebugDrawService::Unregister(DebugDrawHandle);
+	DebugDrawHandle.Reset();
+	Super::EndPlay(EndPlayReason);
+}
+
 void ARealSenseMirrorCamera::RecaptureBackground()
 {
 	GetGameInstance()->GetSubsystem<URealSenseSubsystem>()->RecaptureBackground();
+}
+
+void ARealSenseMirrorCamera::ToggleDebugView()
+{
+	bShowDebugView = !bShowDebugView;
+	GetGameInstance()->GetSubsystem<URealSenseSubsystem>()->SetDebugViewEnabled(bShowDebugView);
+}
+
+void ARealSenseMirrorCamera::DrawDebugView(UCanvas* Canvas, APlayerController* Player)
+{
+	// The service calls this for every viewport: only draw into this world's game view
+	if (!bShowDebugView || !Canvas || !Player || Player->GetWorld() != GetWorld())
+	{
+		return;
+	}
+
+	const URealSenseSubsystem* RealSense = GetGameInstance()->GetSubsystem<URealSenseSubsystem>();
+	UTexture2D* Texture = RealSense->GetDebugTexture();
+	const FRealSenseTrackingStats& Stats = RealSense->GetTrackingStats();
+	if (!Texture || Stats.Width <= 0)
+	{
+		Canvas->SetDrawColor(FColor::White);
+		Canvas->DrawText(GEngine->GetSmallFont(), TEXT("Tracking debug view: waiting for the camera..."), 16.f, Canvas->ClipY - 32.f);
+		return;
+	}
+
+	// Bottom-left, 40% of the screen width
+	const float Margin = 16.f;
+	const float Width = Canvas->ClipX * 0.4f;
+	const float Height = Width * Stats.Height / Stats.Width;
+	const float X = Margin;
+	const float Y = Canvas->ClipY - Height - Margin;
+	Canvas->SetDrawColor(FColor::White);
+	Canvas->DrawTile(Texture, X, Y, Width, Height, 0.f, 0.f, 1.f, 1.f, BLEND_Opaque);
+
+	const int32 MinArea = RealSense->GetSettings().MinPlayerAreaPx;
+	const auto PlayerLine = [&Stats, MinArea](int32 Index)
+	{
+		const TCHAR* State = Stats.Areas[Index] < MinArea ? TEXT("too small, not a player")
+			: Stats.bAnchors[Index] ? TEXT("hand found") : TEXT("player, no hand found");
+		return FString::Printf(TEXT("P%d: %d px (%s)"), Index + 1, Stats.Areas[Index], State);
+	};
+	const FString Lines[] = {
+		FString::Printf(TEXT("Split column %d of %d   |   players need %d px"), Stats.Split, Stats.Width, MinArea),
+		PlayerLine(0) + TEXT("   |   ") + PlayerLine(1),
+		TEXT("blue = P1, green = P2, red = foreground that isn't a player, grey = background")
+	};
+
+	const float LineHeight = 16.f;
+	float TextY = Y - LineHeight * static_cast<float>(UE_ARRAY_COUNT(Lines)) - 4.f;
+	for (const FString& Line : Lines)
+	{
+		Canvas->DrawText(GEngine->GetSmallFont(), Line, X, TextY);
+		TextY += LineHeight;
+	}
 }
 
 void ARealSenseMirrorCamera::ShowStatus() const

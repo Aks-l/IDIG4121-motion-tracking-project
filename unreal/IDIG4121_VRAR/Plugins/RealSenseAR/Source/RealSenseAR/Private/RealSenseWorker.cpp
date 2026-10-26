@@ -39,6 +39,7 @@ struct FRealSenseWorker::FImpl
 	FOneEuroFilter Smoothers[2];
 	FRealSenseHandAnchor Last[2];
 	TArray<uint8> ColorBack;
+	TArray<uint8> DebugBack;
 };
 
 #if WITH_REALSENSE
@@ -230,6 +231,31 @@ uint32 FRealSenseWorker::Run()
 
 				const FPlayerTracker::FResult Result = Impl->Tracker.Process(DepthMm);
 
+				if (bWantDebug)
+				{
+					cv::Mat Debug;
+					Impl->Tracker.DrawDebug(DepthMm, Result, Debug);
+					TArray<uint8>& Back = Impl->DebugBack;
+					Back.SetNumUninitialized(Debug.rows * Debug.cols * 4, EAllowShrinking::No);
+					// Freshly allocated by OpenCV, so continuous
+					FMemory::Memcpy(Back.GetData(), Debug.data, Back.Num());
+
+					FRealSenseTrackingStats Stats;
+					Stats.Width = Debug.cols;
+					Stats.Height = Debug.rows;
+					Stats.Split = Result.Split;
+					for (int32 Index = 0; Index < 2; ++Index)
+					{
+						Stats.Areas[Index] = Result.Areas[Index];
+						Stats.bAnchors[Index] = Result.Anchors[Index].IsSet();
+					}
+
+					FScopeLock ScopeLock(&Lock);
+					Swap(Back, DebugFront);
+					DebugStats = Stats;
+					++DebugSeq;
+				}
+
 				FRealSenseHandAnchor Fresh[2];
 				for (int32 Index = 0; Index < 2; ++Index)
 				{
@@ -303,6 +329,19 @@ bool FRealSenseWorker::TakeColorFrame(TArray<uint8>& OutBGRA, uint64& InOutSeq)
 	// The caller's (usually empty) array becomes the next front buffer
 	Swap(OutBGRA, ColorFront);
 	InOutSeq = ColorSeq;
+	return true;
+}
+
+bool FRealSenseWorker::TakeDebugFrame(TArray<uint8>& OutBGRA, FRealSenseTrackingStats& OutStats, uint64& InOutSeq)
+{
+	FScopeLock ScopeLock(&Lock);
+	if (DebugSeq == InOutSeq || DebugFront.IsEmpty())
+	{
+		return false;
+	}
+	Swap(OutBGRA, DebugFront);
+	OutStats = DebugStats;
+	InOutSeq = DebugSeq;
 	return true;
 }
 

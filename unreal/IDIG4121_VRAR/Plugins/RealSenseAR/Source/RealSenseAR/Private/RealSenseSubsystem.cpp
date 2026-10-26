@@ -7,6 +7,26 @@
 #include "RHICommandList.h"
 #include "TextureResource.h"
 
+namespace
+{
+	/** The pixels move into the render command, which frees them once uploaded: the game thread never waits on the GPU. */
+	void EnqueueUpload(UTexture2D* Texture, TArray<uint8>&& Pixels)
+	{
+		FTextureResource* Resource = Texture->GetResource();
+		const uint32 Width = Texture->GetSizeX();
+		const uint32 Height = Texture->GetSizeY();
+		ENQUEUE_RENDER_COMMAND(UpdateRealSenseTexture)(
+			[Resource, Width, Height, Pixels = MoveTemp(Pixels)](FRHICommandListImmediate& RHICmdList)
+			{
+				if (Resource && Resource->TextureRHI)
+				{
+					const FUpdateTextureRegion2D Region(0, 0, 0, 0, Width, Height);
+					RHICmdList.UpdateTexture2D(Resource->TextureRHI.GetReference(), 0, Region, Width * 4, Pixels.GetData());
+				}
+			});
+	}
+}
+
 void URealSenseSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
@@ -48,6 +68,7 @@ void URealSenseSubsystem::StartCamera()
 		return;
 	}
 	Worker = MakeShared<FRealSenseWorker>(Settings);
+	Worker->SetDebugEnabled(bDebugView);
 	Worker->Start();
 }
 
@@ -112,6 +133,10 @@ void URealSenseSubsystem::Tick(float DeltaTime)
 
 	Worker->GetAnchors(CachedAnchors);
 	UploadColorFrame();
+	if (bDebugView)
+	{
+		UploadDebugFrame();
+	}
 }
 
 void URealSenseSubsystem::UploadColorFrame()
@@ -128,19 +153,45 @@ void URealSenseSubsystem::UploadColorFrame()
 		return;
 	}
 
-	// The pixels move into the render command, which frees them once uploaded. The game thread
-	// never waits on the GPU, and the worker refills a fresh buffer meanwhile.
-	FTextureResource* Resource = ColorTexture->GetResource();
-	ENQUEUE_RENDER_COMMAND(UpdateRealSenseColor)(
-		[Resource, Width, Height, Pixels = MoveTemp(ColorPixels)](FRHICommandListImmediate& RHICmdList)
-		{
-			if (Resource && Resource->TextureRHI)
-			{
-				const FUpdateTextureRegion2D Region(0, 0, 0, 0, Width, Height);
-				RHICmdList.UpdateTexture2D(Resource->TextureRHI.GetReference(), 0, Region, Width * 4, Pixels.GetData());
-			}
-		});
+	// The worker refills a fresh buffer meanwhile
+	EnqueueUpload(ColorTexture, MoveTemp(ColorPixels));
 	ColorPixels.Reset();
+}
+
+void URealSenseSubsystem::SetDebugViewEnabled(bool bEnabled)
+{
+	bDebugView = bEnabled;
+	if (Worker)
+	{
+		Worker->SetDebugEnabled(bEnabled);
+	}
+}
+
+void URealSenseSubsystem::UploadDebugFrame()
+{
+	if (!Worker->TakeDebugFrame(DebugPixels, TrackingStats, DebugSeq))
+	{
+		return;
+	}
+
+	const int32 Width = TrackingStats.Width;
+	const int32 Height = TrackingStats.Height;
+	if (Width <= 0 || Height <= 0 || DebugPixels.Num() != Width * Height * 4)
+	{
+		return;
+	}
+
+	// Sized by the first image: decimation decides the resolution
+	if (!DebugTexture || DebugTexture->GetSizeX() != Width || DebugTexture->GetSizeY() != Height)
+	{
+		DebugTexture = UTexture2D::CreateTransient(Width, Height, PF_B8G8R8A8, TEXT("RealSenseDebug"));
+		DebugTexture->Filter = TF_Nearest;
+		DebugTexture->NeverStream = true;
+		DebugTexture->UpdateResource();
+	}
+
+	EnqueueUpload(DebugTexture, MoveTemp(DebugPixels));
+	DebugPixels.Reset();
 }
 
 ETickableTickType URealSenseSubsystem::GetTickableTickType() const

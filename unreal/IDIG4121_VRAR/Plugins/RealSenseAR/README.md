@@ -50,6 +50,7 @@ The video texture is created with SRGB off on purpose. After the tonemapper, val
 - Make a Blueprint of `ACarriedObject` with the couch mesh. Model the mesh with its length along local +Y and its seat facing +Z.
 - Place an `AObstacleSpawner` and give it a Blueprint of `AZObstacle` with a mesh.
 - Background capture runs by itself. As soon as the camera streams there's a 3 s countdown, shown on screen, then the empty room is learned, so everyone must be out of view. Press **B** (`RecaptureBackgroundKey` on the mirror camera) to learn it again, e.g. after moving the camera or furniture. The switch and the countdown length are in Project Settings > Plugins > RealSense AR (`bAutoCaptureBackground`, `BackgroundCaptureDelayS`). Camera errors appear on screen in red.
+- Press **Tab** (`DebugViewKey`) for the tracking debug view, like Tab in coop_game: the processed depth image in the bottom-left corner, with Player 1 tinted blue, Player 2 green, foreground that didn't count as a player red, the split as a white line and the anchors circled. The text above it gives each half's largest region in px against `MinPlayerAreaPx`. A player who shows up grey was learned as background: recapture with **B**.
 - `Lvl_CoopAR` is the editor startup map and the game default map.
 
 ## Alignment check

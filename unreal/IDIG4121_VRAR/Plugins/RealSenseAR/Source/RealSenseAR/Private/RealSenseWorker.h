@@ -36,6 +36,12 @@ public:
 	/** Invalid until the camera has started. */
 	FRealSenseIntrinsics GetColorIntrinsics() const;
 
+	/** Build the tracking debug image every frame (a few ms), for TakeDebugFrame. */
+	void SetDebugEnabled(bool bEnabled) { bWantDebug = bEnabled; }
+
+	/** Swaps the newest debug image (BGRA8, OutStats.Width x Height) into OutBGRA if it is newer than InOutSeq. */
+	bool TakeDebugFrame(TArray<uint8>& OutBGRA, FRealSenseTrackingStats& OutStats, uint64& InOutSeq);
+
 	/** Learn the empty room after DelaySeconds (so people can step out). */
 	void RequestBackground(double DelaySeconds);
 
@@ -60,6 +66,7 @@ private:
 
 	std::atomic<bool> bStopRequested{ false };
 	std::atomic<bool> bStreaming{ false };
+	std::atomic<bool> bWantDebug{ false };
 
 	mutable FCriticalSection Lock;
 	// Everything below is guarded by Lock
@@ -67,6 +74,9 @@ private:
 	uint64 ColorSeq = 0;
 	FRealSenseHandAnchor Anchors[2];
 	FRealSenseIntrinsics ColorIntrinsics;
+	TArray<uint8> DebugFront;
+	uint64 DebugSeq = 0;
+	FRealSenseTrackingStats DebugStats;
 	double BackgroundCaptureAt = -1.0;
 	FString Error;
 };
