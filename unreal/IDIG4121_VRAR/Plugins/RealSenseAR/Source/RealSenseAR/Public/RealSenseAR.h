@@ -11,6 +11,9 @@ public:
 	virtual void StartupModule() override;
 	virtual void ShutdownModule() override;
 
+	/** False when librealsense2 could not be loaded (Windows delay-loads realsense2.dll). */
+	static bool IsLibraryLoaded();
+
 private:
 	void* RealSenseDllHandle = nullptr;
 };

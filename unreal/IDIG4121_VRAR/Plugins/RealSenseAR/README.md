@@ -22,7 +22,7 @@ ACarriedObject / AZObstacle / AObstacleSpawner (game module)
 
 ## Setup
 
-1. **SDK**: `brew install librealsense` (Mac) or Intel RealSense SDK 2.0 (Windows). For packaged builds, copy `include/` and `lib/<Platform>/` into `Source/ThirdParty/LibRealSense/`, or set `REALSENSE_SDK_DIR`.
+1. **SDK**: `brew install librealsense` (Mac) or Intel RealSense SDK 2.0 (Windows). For packaged builds, copy `include/` and `lib/<Platform>/` into `Source/ThirdParty/LibRealSense/`, or set `REALSENSE_SDK_DIR`. If no SDK is found, the plugin still builds with `WITH_REALSENSE=0`: the project opens and plays, and the camera explains on screen why it is off. Set `REALSENSE_DISABLE=1` to force that mode. For Windows (Visual Studio, first build), see `unreal/WINDOWS_SETUP.md` in the repo.
 2. **macOS caveat**: on recent macOS versions, librealsense often needs root to claim the camera's USB interface ("failed to claim interface"). If the log shows that, launch the editor with `sudo`, or run the installation on Windows, where the SDK is fully supported.
 3. **USB 3**: colour 1280x720 plus depth 848x480 at 30 fps needs a USB 3 port and cable.
 4. Settings live under Project Settings > Plugins > RealSense AR. They are the same numbers as `config.py`.

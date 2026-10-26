@@ -5,10 +5,12 @@
 #include "PlayerTracker.h"
 #include "RealSenseAR.h"
 
+#if WITH_REALSENSE
 THIRD_PARTY_INCLUDES_START
 #include <librealsense2/rs.hpp>
 #include <librealsense2/rsutil.h>
 THIRD_PARTY_INCLUDES_END
+#endif
 
 #include "PreOpenCVHeaders.h"
 #include <opencv2/core.hpp>
@@ -25,9 +27,11 @@ struct FRealSenseWorker::FImpl
 		}
 	}
 
+#if WITH_REALSENSE
 	std::vector<rs2::filter> DepthFilters;
 	float DepthUnitMm = 1.f;
 	rs2_extrinsics DepthToColor{};
+#endif
 
 	FPlayerTracker Tracker;
 	TArray<cv::Mat> BackgroundFrames;
@@ -36,6 +40,7 @@ struct FRealSenseWorker::FImpl
 	TArray<uint8> ColorBack;
 };
 
+#if WITH_REALSENSE
 namespace
 {
 	FRealSenseIntrinsics ToIntrinsics(const rs2_intrinsics& I)
@@ -91,6 +96,7 @@ namespace
 		return Filters;
 	}
 }
+#endif // WITH_REALSENSE
 
 FRealSenseWorker::FRealSenseWorker(const FRealSenseSettings& InSettings)
 	: Settings(InSettings)
@@ -117,6 +123,14 @@ void FRealSenseWorker::Start()
 
 uint32 FRealSenseWorker::Run()
 {
+#if WITH_REALSENSE
+	if (!FRealSenseARModule::IsLibraryLoaded())
+	{
+		// realsense2.dll is delay-loaded: calling into it now would crash instead of throwing
+		SetError(TEXT("realsense2.dll could not be loaded, see the log. Reinstall the Intel RealSense SDK 2.0 and rebuild."));
+		return 0;
+	}
+
 	try
 	{
 		rs2::config Config;
@@ -270,6 +284,9 @@ uint32 FRealSenseWorker::Run()
 	{
 		SetError(UTF8_TO_TCHAR(E.what()));
 	}
+#else
+	SetError(TEXT("built without librealsense2. Install the Intel RealSense SDK 2.0 (Windows) or 'brew install librealsense' (Mac), then rebuild."));
+#endif
 
 	bStreaming = false;
 	return 0;

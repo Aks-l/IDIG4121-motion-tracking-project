@@ -1,27 +1,45 @@
 using System;
 using System.IO;
+using Microsoft.Extensions.Logging;
 using UnrealBuildTool;
 
 // Prebuilt librealsense2, looked up in this order:
 //   1. $REALSENSE_SDK_DIR            (include/ and lib/ beneath it)
 //   2. a copy vendored next to this file: include/, lib/<Platform>/
 //   3. the platform's usual install: Homebrew on Mac, Intel's installer on Windows, /usr on Linux
+//
+// Never fails the build: without the SDK the module compiles with WITH_REALSENSE=0, the project still
+// opens and plays, and the camera reports on screen why it is off. Set REALSENSE_DISABLE=1 to force that.
 public class LibRealSense : ModuleRules
 {
 	public LibRealSense(ReadOnlyTargetRules Target) : base(Target)
 	{
 		Type = ModuleType.External;
 
+		if (!TrySetup(Target))
+		{
+			PublicDefinitions.Add("WITH_REALSENSE=0");
+		}
+	}
+
+	private bool TrySetup(ReadOnlyTargetRules Target)
+	{
+		if (Environment.GetEnvironmentVariable("REALSENSE_DISABLE") == "1")
+		{
+			Logger.LogWarning("REALSENSE_DISABLE=1: building RealSenseAR without camera support.");
+			return false;
+		}
+
 		string Platform = Target.Platform.ToString();
 		string Root = FindSdkRoot(Target);
 		if (Root == null)
 		{
-			throw new BuildException(
-				"librealsense2 not found. Install it (Mac: 'brew install librealsense', Windows: Intel RealSense SDK 2.0) " +
-				"or set REALSENSE_SDK_DIR to a folder holding include/ and lib/.");
+			Logger.LogWarning(
+				"librealsense2 not found, building RealSenseAR without camera support. Install it " +
+				"(Windows: Intel RealSense SDK 2.0, Mac: 'brew install librealsense') or set REALSENSE_SDK_DIR, then rebuild.");
+			return false;
 		}
 
-		PublicSystemIncludePaths.Add(Path.Combine(Root, "include"));
 		bool bVendored = Root.StartsWith(ModuleDirectory);
 
 		if (Target.Platform == UnrealTargetPlatform.Win64)
@@ -32,6 +50,11 @@ public class LibRealSense : ModuleRules
 			string Dll = FirstExisting(
 				Path.Combine(Root, "lib", Platform, "realsense2.dll"),
 				Path.Combine(Root, "bin", "x64", "realsense2.dll"));
+			if (Lib == null || Dll == null)
+			{
+				Logger.LogWarning("librealsense2 headers found in {Root} but realsense2.lib/.dll missing: building without camera support.", Root);
+				return false;
+			}
 
 			PublicAdditionalLibraries.Add(Lib);
 			PublicDelayLoadDLLs.Add("realsense2.dll");
@@ -43,6 +66,11 @@ public class LibRealSense : ModuleRules
 			string Dylib = FirstExisting(
 				Path.Combine(Root, "lib", Platform, "librealsense2.dylib"),
 				Path.Combine(Root, "lib", "librealsense2.dylib"));
+			if (Dylib == null)
+			{
+				Logger.LogWarning("librealsense2 headers found in {Root} but librealsense2.dylib missing: building without camera support.", Root);
+				return false;
+			}
 
 			PublicAdditionalLibraries.Add(Dylib);
 			// A Homebrew dylib loads from its absolute install name, which is fine for the editor.
@@ -58,6 +86,11 @@ public class LibRealSense : ModuleRules
 				Path.Combine(Root, "lib", Platform, "librealsense2.so"),
 				Path.Combine(Root, "lib", "librealsense2.so"),
 				Path.Combine(Root, "lib", "x86_64-linux-gnu", "librealsense2.so"));
+			if (So == null)
+			{
+				Logger.LogWarning("librealsense2 headers found in {Root} but librealsense2.so missing: building without camera support.", Root);
+				return false;
+			}
 
 			PublicAdditionalLibraries.Add(So);
 			if (bVendored)
@@ -65,6 +98,14 @@ public class LibRealSense : ModuleRules
 				RuntimeDependencies.Add(So);
 			}
 		}
+		else
+		{
+			return false;
+		}
+
+		PublicSystemIncludePaths.Add(Path.Combine(Root, "include"));
+		PublicDefinitions.Add("WITH_REALSENSE=1");
+		return true;
 	}
 
 	private string FindSdkRoot(ReadOnlyTargetRules Target)
@@ -118,6 +159,6 @@ public class LibRealSense : ModuleRules
 				return Candidate;
 			}
 		}
-		throw new BuildException("librealsense2 library not found, tried: " + string.Join(", ", Paths));
+		return null;
 	}
 }
