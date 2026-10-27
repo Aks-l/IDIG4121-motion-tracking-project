@@ -110,7 +110,10 @@ class LaserDuel:
             return False
 
         self.reset()
-        self.players = {pid: Player(pid, self.lanes[pid], now) for pid in pids}
+        # LIVES read now, not at import: the settings screen can change it
+        self.players = {
+            pid: Player(pid, self.lanes[pid], now, lives=config.LIVES) for pid in pids
+        }
         self.state = COUNTDOWN
         self.countdown_end = now + config.COUNTDOWN_S
         return True

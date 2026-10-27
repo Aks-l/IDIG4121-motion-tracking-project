@@ -1,0 +1,25 @@
+{
+  "ZONE_X_M": [
+    -2.1,
+    2.1
+  ],
+  "ZONE_DEPTH_M": [
+    0.5,
+    3.0
+  ],
+  "ZONE_HEIGHT_M": [
+    0.06,
+    2.4
+  ],
+  "PLAYER_DEPTH_BAND_M": 0.5,
+  "EDGE_TRIM_PX": 1,
+  "SHOW_REAL_PLAYER": true,
+  "LIVES": 1,
+  "TRAVEL_START_S": 2.4,
+  "TRAVEL_MIN_S": 1.0,
+  "SPAWN_GAP_START_S": 2.2,
+  "SPAWN_GAP_MIN_S": 0.8,
+  "MIN_HIT_CELLS": 4,
+  "HIT_FRAMES": 2,
+  "DISPLAY_LAG_S": 0.08
+}

@@ -13,6 +13,8 @@ import pygame
 class BodyFrame:
     time: float              # time.perf_counter() when it was seen
     bodies: dict             # {1: body grid or None, 2: body grid or None}
+    # The real players (vision.bodies.Picture), None without colour camera
+    pictures: dict = None
 
 
 class BodySource:
@@ -31,6 +33,10 @@ class BodySource:
         """BGR camera debug image, or None."""
         return None
 
+    def camera_text(self):
+        """Where the camera was measured to be, or None."""
+        return None
+
     def set_debug(self, enabled):
         pass
 
@@ -42,12 +48,14 @@ class BodySource:
 
 
 class RealSenseBodySource(BodySource):
+    CALIBRATION_SHOW_S = 4.0
+
     def __init__(self, spec):
         # Imported here so --sim works without pyrealsense2 installed
-        from coop_game import config as camera_config
-        from coop_game.vision.tracker import TrackerThread
+        from . import config
+        from .vision.tracker import TrackerThread
 
-        self.background_delay = camera_config.BACKGROUND_DELAY_S
+        self.background_delay = config.BACKGROUND_DELAY_S
         self.thread = TrackerThread(body_spec=spec)
         self.thread.start()
         self.thread.request_background(self.background_delay)
@@ -59,7 +67,7 @@ class RealSenseBodySource(BodySource):
         result = self.thread.latest()
         if result is None or result.bodies is None:
             return None
-        return BodyFrame(result.time, result.bodies)
+        return BodyFrame(result.time, result.bodies, result.pictures)
 
     def status(self):
         waiting = self.thread.background_status()
@@ -70,11 +78,20 @@ class RealSenseBodySource(BodySource):
 
         if self.thread.latest() is None:
             return "Waiting for the camera..."
+
+        # Where the camera turned out to be, for a few seconds
+        calibration = self.thread.calibration()
+        if calibration is not None and time.perf_counter() - calibration[1] < self.CALIBRATION_SHOW_S:
+            return calibration[0].message
         return None
 
     def debug_image(self):
         result = self.thread.latest()
         return None if result is None else result.debug
+
+    def camera_text(self):
+        calibration = self.thread.calibration()
+        return None if calibration is None else calibration[0].message
 
     def set_debug(self, enabled):
         self.thread.want_debug = enabled

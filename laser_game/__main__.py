@@ -6,12 +6,11 @@
 
 import argparse
 
-from coop_game.vision.bodies import GridSpec
-
-from . import config
+from . import config, settings
 from .duel import make_lanes
 from .game import LaserGame
 from .sources import KeyboardBodySource, RealSenseBodySource
+from .vision.bodies import GridSpec
 
 
 def main():
@@ -19,6 +18,10 @@ def main():
     parser.add_argument("--sim", action="store_true", help="play with the keyboard instead of the camera")
     parser.add_argument("--seed", type=int, help="same seed = same lasers")
     args = parser.parse_args()
+
+    message = settings.load()
+    if message:
+        print(message)
 
     spec = GridSpec(config.PLAY_X_RANGE_M, config.PLAY_HEIGHT_RANGE_M, config.CELL_M)
     if args.sim:

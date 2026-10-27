@@ -7,9 +7,10 @@ import time
 import numpy as np
 import pygame
 
-from . import config
+from . import config, settings
 from .duel import COUNTDOWN, OVER, PLAYING, WAITING, LaserDuel
 from .render import PLAYER_COLORS, Renderer
+from .sources import KeyboardBodySource
 
 TEXT = (235, 235, 245)
 DIM_TEXT = (150, 150, 170)
@@ -30,6 +31,10 @@ class LaserGame:
         self.duel = LaserDuel(spec, random.Random(seed))
         self.renderer = Renderer(config.SCREEN_SIZE, spec, self.duel.lanes)
         self.show_debug = False
+        # With --sim, S is Player 1's duck: the settings open with F1 only
+        sim = isinstance(source, KeyboardBodySource)
+        self.settings_keys = (pygame.K_F1,) if sim else (pygame.K_s, pygame.K_F1)
+        self.menu = SettingsMenu(self.source, "F1" if sim else "S")
 
     def run(self):
         try:
@@ -51,6 +56,18 @@ class LaserGame:
             pygame.quit()
 
     def _on_key(self, key, now):
+        # The settings screen takes the keys while it is open; the game
+        # keeps running behind it
+        if self.menu.open:
+            if key in self.settings_keys or key == pygame.K_ESCAPE:
+                self.menu.hide()
+            else:
+                self.menu.on_key(key, now)
+            return True
+        if key in self.settings_keys:
+            self.menu.show()
+            return True
+
         if key == pygame.K_ESCAPE:
             return False
         if key == pygame.K_r:
@@ -75,6 +92,8 @@ class LaserGame:
         self._draw_hud(now)
         if self.show_debug:
             self._draw_debug()
+        if self.menu.open:
+            self.menu.draw(self.screen, now)
 
     def _draw_hud(self, now):
         duel = self.duel
@@ -134,6 +153,8 @@ class LaserGame:
         self._centered("LASER DUEL", 230, self.big_font, (255, 90, 110))
         self._centered("Player 1: left lane    Player 2: right lane", 300, self.font)
         self._centered("Jump, duck and step aside. First to touch a laser loses!", 335, self.font, DIM_TEXT)
+        key = "F1" if isinstance(self.source, KeyboardBodySource) else "S"
+        self._centered(f"{key}: settings", config.SCREEN_SIZE[1] - 30, self.font, DIM_TEXT)
         if present:
             self._centered("Press Enter to play solo", 380, self.font, DIM_TEXT)
 
@@ -175,3 +196,93 @@ class LaserGame:
         self.screen.blit(shadow, shadow.get_rect(center=(centre[0] + 2, centre[1] + 2)))
         image = font.render(text, True, color)
         self.screen.blit(image, image.get_rect(center=centre))
+
+
+class SettingsMenu:
+    """S: change settings while playing. Up / down choose, left / right
+    change (hold to repeat), Enter saves to settings.json, D goes back to
+    the default from config.py, S or Esc closes."""
+
+    WIDTH = 600
+    ROW = 23
+    NOTE_S = 3.0
+
+    def __init__(self, source, close_key):
+        self.source = source
+        self.close_key = close_key
+        self.open = False
+        self.selected = 0
+        self.note = None          # (text, time)
+        self.title_font = pygame.font.SysFont(None, 40)
+        self.font = pygame.font.SysFont(None, 26)
+        self.small = pygame.font.SysFont(None, 22)
+
+    def show(self):
+        self.open = True
+        pygame.key.set_repeat(300, 60)
+
+    def hide(self):
+        self.open = False
+        pygame.key.set_repeat()
+
+    def on_key(self, key, now):
+        setting = settings.ALL[self.selected]
+        if key == pygame.K_UP:
+            self.selected = (self.selected - 1) % len(settings.ALL)
+        elif key == pygame.K_DOWN:
+            self.selected = (self.selected + 1) % len(settings.ALL)
+        elif key == pygame.K_LEFT:
+            setting.nudge(-1)
+        elif key == pygame.K_RIGHT:
+            setting.nudge(+1)
+        elif key == pygame.K_d:
+            settings.reset(setting)
+        elif key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            try:
+                self.note = (settings.save(), now)
+            except OSError as error:
+                self.note = (f"Not saved: {error}", now)
+
+    def draw(self, screen, now):
+        w, h = config.SCREEN_SIZE
+        x0, y0 = (w - self.WIDTH) // 2, 24
+        panel = pygame.Surface((self.WIDTH, h - 2 * y0), pygame.SRCALPHA)
+        panel.fill((8, 10, 24, 242))
+        screen.blit(panel, (x0, y0))
+        pygame.draw.rect(screen, (90, 110, 170), (x0, y0, self.WIDTH, h - 2 * y0), 2, border_radius=6)
+
+        y = y0 + 12
+        screen.blit(self.title_font.render("Settings", True, TEXT), (x0 + 20, y))
+        camera = self.source.camera_text()
+        if camera:
+            image = self.small.render(camera, True, DIM_TEXT)
+            screen.blit(image, (x0 + self.WIDTH - 20 - image.get_width(), y + 10))
+        y += 42
+
+        index = 0
+        for title, section in settings.SECTIONS:
+            screen.blit(self.small.render(title.upper(), True, (120, 150, 220)), (x0 + 20, y + 4))
+            y += self.ROW + 2
+            for setting in section:
+                chosen = index == self.selected
+                if chosen:
+                    pygame.draw.rect(screen, (40, 60, 120), (x0 + 12, y - 2, self.WIDTH - 24, self.ROW), border_radius=4)
+                color = TEXT if chosen else (200, 200, 215)
+                screen.blit(self.font.render(setting.label, True, color), (x0 + 28, y))
+
+                value = setting.text()
+                if setting.get() != settings.DEFAULTS[setting]:
+                    value += " *"
+                value = f"< {value} >" if chosen else value
+                image = self.font.render(value, True, (255, 220, 120) if chosen else color)
+                screen.blit(image, (x0 + self.WIDTH - 28 - image.get_width(), y))
+                y += self.ROW
+                index += 1
+
+        hints = f"Up/Down choose   Left/Right change   Enter save   D default   {self.close_key} close"
+        lines = [hints, "* = changed from config.py"]
+        if self.note and now - self.note[1] < self.NOTE_S:
+            lines = [self.note[0]] + lines
+        for i, text in enumerate(reversed(lines)):
+            image = self.small.render(text, True, DIM_TEXT if i < 2 else (140, 230, 140))
+            screen.blit(image, (x0 + 20, h - y0 - 26 - 22 * i))

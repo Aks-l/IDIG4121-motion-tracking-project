@@ -14,6 +14,7 @@ import pygame
 
 from . import config
 from .duel import PLAYING
+from .vision.bodies import FINE
 
 PLAYER_COLORS = {1: (60, 140, 255), 2: (60, 210, 100)}
 LASER_COLOR = (255, 40, 70)
@@ -61,6 +62,7 @@ class Renderer:
         self.layer = pygame.Surface(size)
         self.backdrop = self._make_backdrop(size)
         self._silhouettes = {}     # pid -> (key, surface)
+        self._pictures = {}        # pid -> (frame time, surface, topleft)
 
     # ----------------------------------------------------------- scenery
 
@@ -129,6 +131,8 @@ class Renderer:
 
     def draw(self, screen, duel, now):
         screen.blit(self.backdrop, (0, 0))
+        # The real players under the glow: their silhouettes light them up
+        self._draw_pictures(screen, duel)
 
         layer = self.layer
         layer.fill((0, 0, 0))
@@ -198,6 +202,31 @@ class Renderer:
             pygame.draw.circle(layer, scaled(HIT_COLOR, brightness * (1 - t)), centre, radius, 4)
 
     # ------------------------------------------------------- silhouettes
+
+    def _draw_pictures(self, screen, duel):
+        if not config.SHOW_REAL_PLAYER or not duel.frames or not duel.frames[-1].pictures:
+            return
+        frame = duel.frames[-1]
+        view = self.view
+        cell = self.spec.cell / FINE
+
+        for pid in (1, 2):
+            picture = frame.pictures.get(pid)
+            if picture is None:
+                continue
+
+            cached = self._pictures.get(pid)
+            if cached is None or cached[0] != frame.time:
+                h, w = picture.rgba.shape[:2]
+                surface = pygame.image.frombuffer(picture.rgba, (w, h), "RGBA")
+                size = (max(1, round(w * cell * view.scale)), max(1, round(h * cell * view.scale)))
+                topleft = view.project(
+                    self.spec.x_range[0] + picture.col * cell,
+                    self.spec.height_range[1] - picture.row * cell,
+                )
+                cached = (frame.time, pygame.transform.smoothscale(surface, size), topleft)
+                self._pictures[pid] = cached
+            screen.blit(cached[1], cached[2])
 
     def _draw_silhouettes(self, layer, duel, now):
         if not duel.frames:
